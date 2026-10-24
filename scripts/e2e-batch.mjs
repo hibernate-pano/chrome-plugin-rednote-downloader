@@ -11,6 +11,8 @@
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
+
+import { makeRequestCounter, notePageHtml, serializeState, UNDEF } from './fake-site.mjs';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -80,6 +82,17 @@ const NOTES = [
     title: '图集笔记二',
     images: [{ fileId: IMAGE_FILE_ID, width: 1440, height: 1921 }],
   },
+  {
+    // 详情里只有 id 和类型，没有媒体 ——
+    // 模拟「状态先到、媒体后补」时拿到空壳的那种笔记。
+    // 扩展必须把它判成解析失败，而不是「解析成功但一个视频都没有」。
+    id: 'mocknote0004',
+    token: 'mock-token-shell',
+    type: 'video',
+    title: '媒体还没补上的笔记',
+    images: [],
+    shell: true,
+  },
 ];
 
 function noteDetail(note) {
@@ -90,14 +103,21 @@ function noteDetail(note) {
     desc: '这是假站点的测试数据',
     user: { nickname: AUTHOR, userId: 'mockuser0001' },
     interactInfo: { likedCount: 42 },
-    imageList: note.images.map((img) => ({
-      fileId: img.fileId,
-      width: img.width,
-      height: img.height,
-      urlDefault: IMAGE_PREVIEW,
-      url: '',
-      infoList: [{ imageScene: 'WB_DFT', url: IMAGE_PREVIEW }],
-    })),
+    // 空壳笔记（shell）：只有 id 和类型，没有媒体 ——
+    // 模拟「状态先到、媒体后补」时拿到空壳的那种笔记。
+    // 扩展必须把它判成解析失败，而不是「解析成功但一个视频都没有」。
+    ...(note.shell
+      ? {}
+      : {
+          imageList: note.images.map((img) => ({
+            fileId: img.fileId,
+            width: img.width,
+            height: img.height,
+            urlDefault: IMAGE_PREVIEW,
+            url: '',
+            infoList: [{ imageScene: 'WB_DFT', url: IMAGE_PREVIEW }],
+          })),
+        }),
     ...(note.video ? { video: { media: { stream: { h264: [note.video] } } } } : {}),
   };
 }
@@ -118,7 +138,7 @@ function profileState() {
         },
       })),
     },
-    note: { firstNoteId: NOTES[0].id, noteDetailMap: {} },
+    note: { firstNoteId: NOTES[0].id, noteDetailMap: {}, currentNoteId: UNDEF },
   };
 }
 
@@ -139,17 +159,21 @@ function profileHtml() {
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>${AUTHOR} - 小红书</title>
-<script>window.__INITIAL_STATE__ = ${JSON.stringify(profileState())};</script>
+<script>window.__INITIAL_STATE__ = ${serializeState(profileState())};</script>
 </head><body><div id="app"><div class="feeds-container">${cards}</div></div></body></html>`;
 }
 
-function noteHtml(note) {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>${note.title} - 小红书</title>
-<script>window.__INITIAL_STATE__ = ${JSON.stringify({
-    note: { firstNoteId: note.id, noteDetailMap: { [note.id]: { note: noteDetail(note) } } },
-  })};</script>
-</head><body><div id="app"></div></body></html>`;
+/**
+ * 笔记页的 HTML。
+ *
+ * ssrDetail 决定「服务端渲染的 HTML 里有没有笔记详情」：
+ *   true  —— 有。扩展的「抓 HTML」快路能走通，一条笔记都不开 iframe。
+ *   false —— 没有（真站点未登录时就是这样：详情是页面 JS 用 XHR 拉的）。
+ *            扩展必须退回 iframe，而且**只能多花一次抓取**，
+ *            不能给每条笔记都白打一遍。
+ */
+function noteHtml(note, ssrDetail = true) {
+  return notePageHtml({ note, detail: noteDetail(note), ssrDetail });
 }
 
 /* ------------------------------------------------------------------ */
@@ -265,7 +289,13 @@ function downloadRoot() {
 }
 
 async function main() {
+  // 「服务端渲染的 HTML 里有没有笔记详情」—— 真站点未登录时是没有的，
+  // 详情是页面 JS 用 XHR 拉的。两种都要测。
+  let ssrDetail = true;
+  const { counter, record } = makeRequestCounter();
+
   const server = createServer((req, res) => {
+    record(req);
     const url = new URL(req.url, 'http://127.0.0.1');
     res.setHeader('content-type', 'text/html; charset=utf-8');
     if (url.pathname.startsWith('/user/profile/')) {
@@ -276,7 +306,7 @@ async function main() {
     if (explore) {
       const note = NOTES.find((n) => n.id === explore[1]);
       if (note) {
-        res.end(noteHtml(note));
+        res.end(noteHtml(note, ssrDetail));
         return;
       }
     }
@@ -436,10 +466,10 @@ async function main() {
       console.log('   RPC 探针:', probe, probeResp);
     }
 
-    check('主页扫描出卡片', (vm?.cards || []).length === 3, `cards=${JSON.stringify(vm?.cards)}`);
+    check('主页扫描出卡片', (vm?.cards || []).length === 4, `cards=${JSON.stringify(vm?.cards)}`);
     check(
-      '分类计数正确（视频 1 / 图集 2）',
-      /视频\s*1/.test(vm?.headSub || '') && /图集\s*2/.test(vm?.headSub || ''),
+      '分类计数正确（视频 2 / 图集 2）',
+      /视频\s*2/.test(vm?.headSub || '') && /图集\s*2/.test(vm?.headSub || ''),
       `headSub=${vm?.headSub}`,
     );
     check(
@@ -473,10 +503,10 @@ async function main() {
         };
       })()
     `);
-    check('全选生效', afterSelect.selected === 3, `selected=${afterSelect.selected} footer=${afterSelect.footer}`);
+    check('全选生效', afterSelect.selected === 4, `selected=${afterSelect.selected} footer=${afterSelect.footer}`);
     check(
       '主按钮带数量',
-      /3/.test(afterSelect.startBtn || ''),
+      /4/.test(afterSelect.startBtn || ''),
       `startBtn=${afterSelect.startBtn}`,
     );
 
@@ -594,6 +624,40 @@ async function main() {
     const extensionErrors = logs.filter((l) => l.kind === 'error' || l.kind === 'exception');
     check('扩展无运行时报错', extensionErrors.length === 0, extensionErrors.slice(0, 3).map((e) => e.text.slice(0, 200)).join(' | '));
 
+    // 解析走的是哪条路 —— 这一条直接决定几百条笔记时机器会不会卡
+    // 抓 HTML（快路）：每条笔记一次 fetch，不开 iframe
+    // 隐藏 iframe（兜底）：每条笔记一个真实页面导航
+    check(
+      '解析走的是「抓 HTML」快路：只有媒体拿不到的那条才退回 iframe',
+      counter.iframe === 1,
+      `抓取 ${counter.fetch} 次 / iframe ${counter.iframe} 个（4 条笔记里 1 条媒体拿不到）`,
+    );
+    check(
+      '快路对每条笔记各抓一次，没有多抓',
+      counter.fetch === 4,
+      `抓取 ${counter.fetch} 次（笔记 4 条）`,
+    );
+
+    // 媒体拿不到的那条笔记必须**看得见地失败**，不能是「解析成功但一个视频都没有」
+    const shellCard = await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        const cards = [...sr.querySelectorAll('.rn-card')];
+        const card = cards.find(c => (c.textContent || '').includes('媒体还没补上的笔记'));
+        return JSON.stringify({
+          found: !!card,
+          meta: card?.querySelector('.rn-card-meta')?.textContent || '',
+          text: (card?.textContent || '').slice(0, 120),
+        });
+      })()
+    `);
+    const shell = JSON.parse(shellCard);
+    check(
+      '媒体拿不到的笔记标成「解析失败」（不静默成功）',
+      shell.found && /解析失败/.test(shell.meta),
+      `卡片状态：${shell.meta || shell.text}`,
+    );
+
     /* ------------------------------------------------------------------ */
     /* 第二轮：文件类型筛选 —— 只下载视频                                  */
     /* ------------------------------------------------------------------ */
@@ -637,7 +701,7 @@ async function main() {
     `);
     check(
       '切到「只下载视频」后卡片列表不变（只影响下载，不影响展示）',
-      filterState.cards === 3,
+      filterState.cards === 4,
       `cards=${filterState.cards}`,
     );
     check(
@@ -839,6 +903,90 @@ async function main() {
 
     // 清理：只删本次测试产生的文件
     for (const f of flatFresh) {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 第四轮：SSR 的 HTML 里没有笔记详情（真站点未登录时就是这样）         */
+    /* ------------------------------------------------------------------ */
+
+    console.log('\n▶ 换成「SSR 里没有详情」的站点，再下载一次…');
+    ssrDetail = false;
+    counter.fetch = 0;
+    counter.iframe = 0;
+    counter.other = 0;
+
+    // 重新加载页面 = 新的 content script 实例（路径判定从头开始）
+    await cdp.send('Page.navigate', {
+      url: `${origin}/user/profile/mockuser0001?xsec_token=mock`,
+    });
+    await sleep(2000);
+    for (let i = 0; i < 40; i += 1) {
+      const ok = await evaluate(
+        `!!document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-fab')`,
+      );
+      if (ok) break;
+      await sleep(400);
+    }
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        sr.querySelector('.rn-fab').click();
+        return true;
+      })()
+    `);
+
+    // 等扫描出卡片
+    for (let i = 0; i < 40; i += 1) {
+      await sleep(400);
+      const n = await evaluate(
+        `document.querySelector('rednote-root').shadowRoot.querySelectorAll('.rn-card').length`,
+      );
+      if (n >= 3) break;
+    }
+
+    const beforeNoSsr = walk(downloadRoot());
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        const all = [...sr.querySelectorAll('.rn-toolbar-right .rn-btn')].find(b => /全选/.test(b.textContent));
+        if (all) all.click();
+        const start = sr.querySelector('.rn-footer .rn-btn[data-variant="primary"]');
+        if (start) start.click();
+        return true;
+      })()
+    `);
+
+    let noSsrFresh = [];
+    for (let i = 0; i < 60; i += 1) {
+      await sleep(700);
+      noSsrFresh = walk(downloadRoot()).filter(
+        (f) => !beforeNoSsr.includes(f) && !f.endsWith('.crdownload'),
+      );
+      if (noSsrFresh.length >= 4) break;
+    }
+    check(
+      '没有 SSR 详情时照样能下全（退回 iframe 兜底）',
+      noSsrFresh.length === 4,
+      `新增 ${noSsrFresh.length} 个`,
+    );
+    check(
+      '兜底时用的是隐藏 iframe（每条笔记一个页面导航）',
+      counter.iframe === 4,
+      `iframe ${counter.iframe} 个 / 抓取 ${counter.fetch} 次`,
+    );
+    check(
+      '快路不可用时只多花一次抓取，不是每条笔记都白打一遍',
+      counter.fetch === 1,
+      `抓取 ${counter.fetch} 次（笔记 3 条）—— 每条都白抓一次的话会把站点压力翻倍，` +
+        '还会跟 iframe 抢连接池，把解析成功率拖下去',
+    );
+
+    for (const f of noSsrFresh) {
       try {
         fs.rmSync(f, { force: true });
       } catch {

@@ -3,9 +3,18 @@ import type { MediaItem, NoteInfo, Settings } from '../../shared/types';
 import { shortId, sleep } from '../../shared/utils';
 import { noteToInfo, noteToMediaItems } from './media';
 import type { RawNote, RawNoteRef } from './raw';
-import { isObj, num, str, unref } from './raw';
+import { hasMedia, isObj, num, str, unref } from './raw';
 
 export type PageKind = 'note' | 'profile' | 'unknown';
+
+/**
+ * 「解析一条笔记」这个调用的超时。
+ *
+ * 页面钩子那边给这条链路留了 20s 预算（抓 HTML 最多 5s，剩下的给隐藏 iframe），
+ * 桥接层必须比它宽 —— 不然预算没用完，调用先被砍了，
+ * 界面上的表现是「解析失败」，实际是超时。
+ */
+const NOTE_DETAIL_TIMEOUT_MS = 26000;
 
 export function classifyPage(path: string): PageKind {
   if (/\/explore\/[A-Za-z0-9_-]+/i.test(path)) return 'note';
@@ -49,6 +58,10 @@ export class Detector {
     try {
       const res = await bridge.call<{ note: RawNote | null }>('state.note', { noteId, loose: true });
       if (res?.note) {
+        // 状态是一点点填进来的：一开始只有 id 和标题，媒体是后面才补上的。
+        // 拿到空壳就当「还没好」—— 让调用方继续等，
+        // 免得面板上出现「识别成功，但一个视频都没有」。
+        if (res.note.videos.length === 0 && res.note.images.length === 0) return null;
         const info = noteToInfo(res.note, settings, location.href);
         info.source = 'initial-state';
         return info;
@@ -356,11 +369,13 @@ export class Detector {
     let source: NoteInfo['source'] = 'api';
 
     // 1) 页面状态里已经有这条笔记的话，直接用（必须 id 对得上）
+    //    注意：状态里的笔记可能还是个空壳（只有 id 和标题，媒体没补上），
+    //    那种不能算 —— 得继续往下走第 2 步，让页面把媒体加载出来。
     try {
       const res = await bridge.call<{ note: RawNote | null }>('state.note', {
         noteId: ref.noteId,
       });
-      if (res?.note && res.note.noteId === ref.noteId) {
+      if (res?.note && res.note.noteId === ref.noteId && hasMedia(res.note)) {
         raw = res.note;
         source = 'initial-state';
       }
@@ -377,6 +392,10 @@ export class Detector {
             noteId: ref.noteId,
             xsecToken: ref.xsecToken,
           },
+          // 解析一条笔记自带 20s 预算（抓 HTML + 隐藏 iframe），
+          // 桥接层默认的 15s 会在它用完之前就把这次调用砍掉 ——
+          // 表现就是「解析失败」，而页面其实还在正常跑。
+          NOTE_DETAIL_TIMEOUT_MS,
         );
         if (res?.ok && res.note) raw = res.note;
       } catch {
@@ -385,6 +404,13 @@ export class Detector {
     }
 
     if (!raw) return null;
+
+    // **没有媒体的笔记不算解析成功。**
+    // 页面的状态是先有 id、标题，媒体（视频直链 / 图片列表）是后补的。
+    // 早一步返回就会拿到一个空壳 —— 界面上是「解析成功但一个视频都没有」，
+    // 既不报错也不重试，用户只能看着干着急。
+    // 判成失败，用户至少看得见、能重试。
+    if (!hasMedia(raw)) return null;
 
     // 标题只有一个来源：笔记详情里的标题优先，拿不到就用列表卡片上的标题
     // （推荐流的 displayTitle 比笔记详情可靠 —— 有一部分笔记详情里的 title 是空串）。

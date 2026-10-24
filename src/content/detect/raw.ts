@@ -352,6 +352,19 @@ export function titleFromDesc(desc: unknown): string {
 }
 
 /**
+ * 一条笔记有没有可下载的媒体（视频或图片）。
+ *
+ * **空壳笔记不算。**
+ * 页面的状态是先有 id、标题，媒体（视频直链 / 图片列表）是后补的 ——
+ * 早一步读到的就是「有 id 没视频」的空壳。
+ * 把它当成解析成功，界面上就是「解析成功但一个视频都没有」：
+ * 既不报错也不重试，用户只能看着干着急。
+ */
+export function hasMedia(note: RawNote): boolean {
+  return note.videos.length > 0 || note.images.length > 0;
+}
+
+/**
  * 从 __INITIAL_STATE__ 里取出笔记详情。
  *
  * 传了 noteId 就必须精确命中：拿不到就返回 null。
@@ -504,4 +517,126 @@ export function extractUser(state: any): { userId?: string; nickname?: string; a
     nickname: str(basic.nickname) || str(basicInfo.nickname) || undefined,
     avatar: str(basic.avatar) || str(basicInfo.imageb) || undefined,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* 页面状态里内联的 __INITIAL_STATE__                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 从 HTML 里抠出 __INITIAL_STATE__。
+ *
+ * 站点把它内联在 <script> 里，形如 `window.__INITIAL_STATE__={...}`。
+ * 不能用正则去匹配对象（里面的字符串里可能有花括号），
+ * 所以按括号配平扫描，跳过字符串字面量。
+ *
+ * **注意：它不是 JSON，是 JavaScript 对象字面量。**
+ * 实测（2026-10-24 真实站点）：状态里有 20~30 处 `undefined`，
+ * 直接 `JSON.parse` 一定抛错。所以解析失败时要再试一次 ——
+ * 把字符串外面的 `undefined` 换成 `null` 再解。
+ */
+export function parseInitialState(html: string): any | null {
+  const marker = 'window.__INITIAL_STATE__';
+  const at = html.indexOf(marker);
+  if (at < 0) return null;
+  const eq = html.indexOf('=', at + marker.length);
+  if (eq < 0) return null;
+  const start = html.indexOf('{', eq);
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < html.length; i += 1) {
+    const ch = html.charAt(i);
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        const text = html.slice(start, i + 1);
+        try {
+          return JSON.parse(text);
+        } catch {
+          return parseJsLiteral(text);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 解析 JavaScript 对象字面量（不是 JSON）。
+ *
+ * 只做一件事：把字符串外面的 `undefined` / `NaN` / `Infinity` 换成 `null`，
+ * 让剩下的文本变成合法 JSON。
+ *
+ * 为什么不直接 `new Function('return (' + text + ')')()`：
+ * 那等于执行站点给的代码。没必要 —— 实测站点状态里只有 `undefined`
+ * 这一个非 JSON 字面量（2026-10-24 真实站点，29 处），
+ * 替换掉就够了，而且不执行任何外来代码。
+ */
+function parseJsLiteral(text: string): any | null {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text.charAt(i) as string;
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    // 只有独立成词的 undefined 才换 —— "undefined" 这种字符串不动
+    if (isWordAt(text, i, 'undefined')) {
+      out += 'null';
+      i += 'undefined'.length - 1;
+      continue;
+    }
+    if (isWordAt(text, i, 'NaN') || isWordAt(text, i, 'Infinity')) {
+      // -Infinity 要连着前面的负号一起换掉，不然会留下一个非法的 "-null"
+      if (out.endsWith('-')) out = out.slice(0, -1);
+      out += 'null';
+      i += text.startsWith('Infinity', i) ? 'Infinity'.length - 1 : 'NaN'.length - 1;
+      continue;
+    }
+    out += ch;
+  }
+
+  try {
+    return JSON.parse(out);
+  } catch {
+    return null;
+  }
+}
+
+/** text[i] 处是不是一个独立的单词（前后不是标识符字符） */
+function isWordAt(text: string, i: number, word: string): boolean {
+  if (!text.startsWith(word, i)) return false;
+  const before = text.charAt(i - 1);
+  const after = text.charAt(i + word.length);
+  return !/[\w$]/.test(before) && !/[\w$]/.test(after);
 }

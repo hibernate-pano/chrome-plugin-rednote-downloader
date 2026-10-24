@@ -13,7 +13,9 @@ import {
   collectNoteRefs,
   extractNoteFromState,
   extractUser,
+  hasMedia,
   isObj,
+  parseInitialState,
   unref,
   type RawNote,
   type RawNoteRef,
@@ -214,22 +216,52 @@ const handlers: Record<string, Handler> = {
    * 实测几百条之后浏览器会明显变卡、页面请求都发不出去。
    * 抓 HTML 是同样数量的轻量请求，没有渲染、没有脚本执行，快一个量级。
    *
+   * **但这条路不能用「每条笔记都试一次」的笨办法**：
+   * 抓 HTML 和 iframe 加载走的是同一个站点、同一个连接池（浏览器每个域名 6 条）。
+   * 多打一遍等于把站点的压力翻倍，iframe 反而被挤掉 ——
+   * 表现出来就是「解析经常失败」。
+   * 所以先试第一条，判定这条路通不通，之后整个会话只走一条路。
+   * （判定依据见 fetchPathState）
+   *
    * 为什么不直接调站点 API：页面的 X-s 签名依赖一整套反爬头（mnsv2 / a1 /
    * X-S-Common），site 改一次就失效，不值得依赖。
+   * （实测：借站点的 X-S-Common 调 /feed 仍然是 500。）
    */
   'api.noteDetail': async (params: { noteId: string; xsecToken?: string }) => {
     const { noteId, xsecToken } = params ?? {};
     if (!noteId) return { ok: false, error: 'missing noteId' };
 
-    try {
-      const note = await loadNoteViaFetch(noteId, xsecToken);
-      if (note) return { ok: true, note, via: 'fetch' };
-    } catch {
-      /* ignore */
+    // 整条链路的预算：抓 HTML 最多 5s，剩下的时间留给隐藏 iframe。
+    // 桥接层给这个调用单独放宽了超时（默认 15s 会在这条链路上被吃光）。
+    const deadline = Date.now() + NOTE_DETAIL_BUDGET_MS;
+
+    // 主路：抓 HTML
+    if (fetchPathState !== 'unusable') {
+      try {
+        const result = await loadNoteViaFetch(noteId, xsecToken);
+        if (result.note) {
+          fetchMisses = 0;
+          fetchPathState = 'usable';
+          return { ok: true, note: result.note, via: 'fetch' };
+        }
+        if (result.verdict === 'broken') {
+          // 这条路本身坏了（请求失败、HTML 里连状态都没有）—— 整场都别再试
+          fetchPathState = 'unusable';
+        } else {
+          // 抓到了 HTML，但里面没有这条笔记。
+          // 可能是这条笔记特殊，也可能是站点压根不把详情渲染进 HTML ——
+          // 连着几次都这样就别再试了（每次试都是白打一个请求）。
+          fetchMisses += 1;
+          if (fetchMisses >= FETCH_MISS_LIMIT) fetchPathState = 'unusable';
+        }
+      } catch {
+        fetchPathState = 'unusable';
+      }
     }
 
+    // 兜底：隐藏 iframe
     try {
-      const note = await loadNoteViaFrame(noteId, xsecToken);
+      const note = await loadNoteViaFrame(noteId, xsecToken, deadline);
       if (note) return { ok: true, note, via: 'iframe' };
     } catch {
       /* ignore */
@@ -239,70 +271,151 @@ const handlers: Record<string, Handler> = {
   },
 };
 
+/** 解析一条笔记的总预算（毫秒）：抓 HTML + 隐藏 iframe 加起来不能超过它 */
+const NOTE_DETAIL_BUDGET_MS = 20000;
+/** 抓 HTML 单次请求的上限 —— 请求卡住时不能把整条链路耗光 */
+const FETCH_TIMEOUT_MS = 5000;
+/** 隐藏 iframe 等媒体补齐的上限 */
+const FRAME_WAIT_MS = 10000;
+/** 连续几次「抓到了 HTML 但没有这条笔记」之后，判定快路不可用 */
+const FETCH_MISS_LIMIT = 3;
+
 /**
- * 从 HTML 里抠出 __INITIAL_STATE__。
+ * 抓 HTML 这条路通不通。
  *
- * 站点把它内联在 <script> 里，形如 `window.__INITIAL_STATE__={...}`。
- * 不能用正则去匹配对象（里面的字符串里可能有花括号），
- * 所以按括号配平扫描，跳过字符串字面量。
+ * 'unknown'  —— 还没试过
+ * 'usable'   —— 抓到的 HTML 里有这条笔记的详情，往后就走快路
+ * 'unusable' —— 这条路对站点不管用，整场都别再试 ——
+ *               每条笔记白打一个请求，还会跟 iframe 抢连接池，
+ *               把解析成功率拖下去。
  */
-function parseInitialState(html: string): any | null {
-  const marker = 'window.__INITIAL_STATE__';
-  const at = html.indexOf(marker);
-  if (at < 0) return null;
-  const eq = html.indexOf('=', at + marker.length);
-  if (eq < 0) return null;
-  const start = html.indexOf('{', eq);
-  if (start < 0) return null;
+let fetchPathState: 'unknown' | 'usable' | 'unusable' = 'unknown';
 
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < html.length; i += 1) {
-    const ch = html.charAt(i);
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === '\\') {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === '{') {
-      depth += 1;
-    } else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) {
-        try {
-          return JSON.parse(html.slice(start, i + 1));
-        } catch {
-          return null;
-        }
-      }
-    }
+/** 连续「抓到 HTML 但没有目标笔记」的次数 */
+let fetchMisses = 0;
+
+/**
+ * 读一下当前判定。
+ *
+ * 单独写成函数是因为 TypeScript 会在函数内把变量收窄，
+ * 而这里等 await 之后别的函数可能已经改过它了。
+ */
+function isFetchPathUnusable(): boolean {
+  return fetchPathState === 'unusable';
+}
+
+/** 一次抓取的结果 */
+type FetchVerdict =
+  /** 拿到了这条笔记（带媒体） */
+  | 'ok'
+  /** 抓到了 HTML，但里面没有这条笔记 */
+  | 'miss'
+  /** 请求失败 / HTML 里连状态都没有 —— 这条路本身是坏的 */
+  | 'broken';
+
+/**
+ * 正在进行的探测。
+ *
+ * 主页批量是**并发**解析的：三条笔记会同时开抓。
+ * 如果只靠一个布尔标记，三条会各自抓一次 ——
+ * 「只多花一次请求」的保证就没了，等于把站点压力翻倍。
+ * 所以第一条在抓的时候，后面的等它的结论：
+ *   - 结论是「这条路坏了」 → 后面直接放弃，一次请求都不多打
+ *   - 结论是「这条路行」  → 后面各自去抓自己那条（每条笔记的 HTML 都不一样）
+ */
+let fetchProbe: Promise<{ note: RawNote | null; verdict: FetchVerdict }> | null = null;
+
+/**
+ * 抓笔记页的 HTML，从里面解析出笔记详情。
+ */
+async function loadNoteViaFetch(
+  noteId: string,
+  xsecToken?: string,
+): Promise<{ note: RawNote | null; verdict: FetchVerdict }> {
+  // 已经判定这条路不行了 → 一次请求都不多打
+  if (isFetchPathUnusable()) return { note: null, verdict: 'broken' };
+
+  // 已经有人在探路了 → 等它的结论，别再打一次请求
+  if (fetchProbe) {
+    await fetchProbe.catch(() => undefined);
+    if (isFetchPathUnusable()) return { note: null, verdict: 'broken' };
+    return await fetchNotePage(noteId, xsecToken);
   }
-  return null;
+
+  fetchProbe = fetchNotePage(noteId, xsecToken);
+  try {
+    return await fetchProbe;
+  } finally {
+    fetchProbe = null;
+  }
 }
 
-/** 抓笔记页的 HTML，从里面解析出笔记详情 */
-async function loadNoteViaFetch(noteId: string, xsecToken?: string): Promise<RawNote | null> {
+/** 真的去抓一次笔记页的 HTML */
+async function fetchNotePage(
+  noteId: string,
+  xsecToken?: string,
+): Promise<{ note: RawNote | null; verdict: FetchVerdict }> {
   const url = `/explore/${encodeURIComponent(noteId)}${xsecToken ? `?xsec_token=${encodeURIComponent(xsecToken)}` : ''}`;
-  const response = await fetch(url, { credentials: 'include' });
-  if (!response.ok) return null;
-  const html = await response.text();
+  let html: string;
+  // 必须自己掐表：站点的响应可能很慢（甚至挂着），
+  // 不设上限的话这一次请求就能把整条链路的预算吃光。
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      credentials: 'include',
+      signal: controller.signal,
+    });
+    if (!response.ok) return { note: null, verdict: 'broken' };
+    html = await response.text();
+  } catch {
+    return { note: null, verdict: 'broken' };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // 站点的状态是 JavaScript 对象字面量（里面带 undefined），
+  // 不是合法 JSON —— parseInitialState 做了容错处理，抠不出来就是没有状态。
   const state = parseInitialState(html);
-  if (!state) return null;
-  return extractNoteFromState(state, noteId);
+  if (!state) return { note: null, verdict: 'broken' };
+
+  const note = extractNoteFromState(state, noteId);
+  if (note) {
+    // 抠到了但没有媒体 = 拿到的是个空壳，等于没解析出来
+    if (!hasMedia(note)) return { note: null, verdict: 'miss' };
+    return { note, verdict: 'ok' };
+  }
+
+  // 压根没抠到这条笔记。再看一眼状态里有没有「笔记详情」这一块：
+  //   - 有详情、只是里面没有我们这条 → 这条笔记特殊，算一次 miss
+  //   - 连详情块都是空的 → 站点压根不把详情渲染进 HTML。
+  //     实测（2026-10-24 真实站点）：笔记页 SSR 里的 noteDetailMap 就是空的，
+  //     详情是页面 JS 跑起来之后用 XHR 拉的 ——
+  //     这种站点上快路是白费的，认出来就能整场都别再试。
+  const noteState = unref((state as any)?.note);
+  const detailMap = unref(noteState?.noteDetailMap);
+  const hasDetails =
+    detailMap && typeof detailMap === 'object' && Object.keys(detailMap).length > 0;
+  return { note: null, verdict: hasDetails ? 'miss' : 'broken' };
 }
 
-/** 用隐藏 iframe 加载笔记页，读取它的 __INITIAL_STATE__ */
-async function loadNoteViaFrame(noteId: string, xsecToken?: string): Promise<RawNote | null> {
+/**
+ * 用隐藏 iframe 加载笔记页，读取它的 __INITIAL_STATE__。
+ *
+ * **必须等到笔记里真的有媒体才算数。**
+ * 页面的状态是一点点填进来的：一开始只有 id、标题这些，
+ * 视频直链是后面 XHR 回来才补上的。
+ * 早返回一步就会拿到一个「有 id 没视频」的空壳 ——
+ * 界面上表现为「解析成功了，但一个视频都没有」，而且不会重试、不会报错。
+ *
+ * deadline 是整条链路的截止时间（抓 HTML 可能已经花掉几秒），
+ * 不能在这里又从头给一份完整预算。
+ */
+async function loadNoteViaFrame(
+  noteId: string,
+  xsecToken: string | undefined,
+  deadline: number,
+): Promise<RawNote | null> {
   const url = `/explore/${encodeURIComponent(noteId)}${xsecToken ? `?xsec_token=${encodeURIComponent(xsecToken)}` : ''}`;
   const frame = document.createElement('iframe');
   frame.style.cssText =
@@ -312,9 +425,9 @@ async function loadNoteViaFrame(noteId: string, xsecToken?: string): Promise<Raw
 
   try {
     // 笔记页是 SSR 的，状态内联在 HTML 里，实测 370ms 就能读到。
-    // 轮询密一点省时间，超时给 8s —— 失败时别让用户干等十几秒。
-    const deadline = Date.now() + 8000;
-    while (Date.now() < deadline) {
+    // 但媒体是后补的，所以要给足时间。
+    const end = Math.min(deadline, Date.now() + FRAME_WAIT_MS);
+    while (Date.now() < end) {
       await new Promise((r) => setTimeout(r, 80));
       let state: any = null;
       try {
@@ -322,10 +435,12 @@ async function loadNoteViaFrame(noteId: string, xsecToken?: string): Promise<Raw
       } catch {
         state = null;
       }
-      if (state) {
-        const note = extractNoteFromState(state, noteId);
-        if (note) return note;
-      }
+      if (!state) continue;
+      const note = extractNoteFromState(state, noteId);
+      if (!note) continue;
+      // 空壳不算 —— 继续等媒体补上
+      if (!hasMedia(note)) continue;
+      return note;
     }
     return null;
   } finally {

@@ -1,8 +1,10 @@
 /**
  * 规模探针：批量下载到几百个文件时，到底哪里变慢了。
  *
- * 用法：node scripts/probe-scale.mjs [文件数] [模式] [并发数]
+ * 用法：node scripts/probe-scale.mjs [文件数] [模式] [并发数] [nos]
  *   模式：browser（交给 Chrome 逐个下）| zip（打成一个包再下）
+ *   nos：假站点的笔记页也**不**在 SSR 里带详情（真站点的情形），
+ *        用来量「只能退回隐藏 iframe」的最坏情况
  * 前置：npm run build
  *
  * 用户反馈「下载超过一两百个文件后系统变得很卡，甚至报错」。
@@ -26,12 +28,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { serializeState, UNDEF } from './fake-site.mjs';
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'dist');
 
 const FILE_COUNT = Number(process.argv[2] || 300);
 const MODE = process.argv[3] || 'zip';
 const CONCURRENCY = Number(process.argv[4] || 3);
+/**
+ * 真站点的笔记页 HTML 里**没有**笔记详情（详情是页面 JS 用 XHR 拉的）。
+ * 传 'nos' 就让假站点也这样 —— 那是真实站点上的最坏情况：
+ * 抓 HTML 这条快路用不上，只能退回隐藏 iframe。
+ */
+const NO_SSR_DETAIL = process.argv[5] === 'nos';
 const MEDIA_BYTES = 64 * 1024;
 
 const CHROME_CANDIDATES = [
@@ -115,48 +125,62 @@ function profileHtml(origin) {
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>${AUTHOR} - 小红书</title>
-<script>window.__INITIAL_STATE__ = ${JSON.stringify(profileState(origin))};</script>
+<script>window.__INITIAL_STATE__ = ${serializeState(profileState(origin))};</script>
 </head><body><div id="app"><div class="feeds-container">${cards}</div></div></body></html>`;
 }
 
 function exploreHtml(note, origin) {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>${note.title} - 小红书</title>
-<script>window.__INITIAL_STATE__ = ${JSON.stringify({
+  const detail = {
     note: {
-      firstNoteId: note.id,
-      noteDetailMap: {
-        [note.id]: {
-          note: {
-            noteId: note.id,
-            type: 'video',
-            title: note.title,
-            desc: '规模测试',
-            user: { nickname: AUTHOR, userId: 'scaleuser0001' },
-            interactInfo: { likedCount: 42 },
-            imageList: [],
-            video: {
-              media: {
-                stream: {
-                  h264: [
-                    {
-                      masterUrl: `${origin}/media/${note.id}.mp4`,
-                      backupUrls: [],
-                      width: 1080,
-                      height: 1920,
-                      duration: 10,
-                      size: MEDIA_BYTES,
-                      format: 'mp4',
-                    },
-                  ],
-                },
+      noteId: note.id,
+      type: 'video',
+      title: note.title,
+      desc: '规模测试',
+      currentNoteId: UNDEF,
+      user: { nickname: AUTHOR, userId: 'scaleuser0001' },
+      interactInfo: { likedCount: 42 },
+      imageList: [],
+      video: {
+        media: {
+          stream: {
+            h264: [
+              {
+                masterUrl: `${origin}/media/${note.id}.mp4`,
+                backupUrls: [],
+                width: 1080,
+                height: 1920,
+                duration: 10,
+                size: MEDIA_BYTES,
+                format: 'mp4',
               },
-            },
+            ],
           },
         },
       },
     },
-  })};</script>
+  };
+
+  // NO_SSR_DETAIL：模拟真站点 —— SSR 的 HTML 里没有详情，
+  // 详情由页面脚本过一会儿补上（真实站点是 XHR 回来之后才写进状态的）
+  const state = {
+    note: {
+      firstNoteId: note.id,
+      noteDetailMap: NO_SSR_DETAIL ? {} : { [note.id]: detail },
+      currentNoteId: UNDEF,
+    },
+  };
+  const fill = NO_SSR_DETAIL
+    ? `
+<script>
+  setTimeout(function () {
+    window.__INITIAL_STATE__.note.noteDetailMap[${JSON.stringify(note.id)}] = ${JSON.stringify(detail)};
+  }, 250);
+</script>`
+    : '';
+
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${note.title} - 小红书</title>
+<script>window.__INITIAL_STATE__ = ${serializeState(state)};</script>${fill}
 </head><body></body></html>`;
 }
 

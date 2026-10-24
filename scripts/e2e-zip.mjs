@@ -17,6 +17,8 @@
 import { spawn, execFileSync } from 'node:child_process';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
+
+import { notePageHtml, serializeState, UNDEF } from './fake-site.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -98,7 +100,7 @@ function profileState() {
         },
       })),
     },
-    note: { firstNoteId: NOTES[0].id, noteDetailMap: {} },
+    note: { firstNoteId: NOTES[0].id, noteDetailMap: {}, currentNoteId: UNDEF },
   };
 }
 
@@ -114,16 +116,16 @@ function profileHtml() {
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>${AUTHOR} - 小红书</title>
-<script>window.__INITIAL_STATE__ = ${JSON.stringify(profileState())};</script>
+<script>window.__INITIAL_STATE__ = ${serializeState(profileState())};</script>
 </head><body><div id="app"><div class="feeds-container">${cards}</div></div></body></html>`;
 }
 
+/**
+ * 笔记页的 HTML —— 走共享的生成器，形状跟真站点一致
+ * （状态是 JavaScript 对象字面量，里面有 undefined，不是纯 JSON）。
+ */
 function noteHtml(note, origin) {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>${note.title} - 小红书</title>
-<script>window.__INITIAL_STATE__ = ${JSON.stringify({
-    note: { firstNoteId: note.id, noteDetailMap: { [note.id]: { note: noteDetail(note, origin) } } },
-  })};</script></head><body><div id="app"></div></body></html>`;
+  return notePageHtml({ note, detail: noteDetail(note, origin) });
 }
 
 /* ------------------------------------------------------------------ */

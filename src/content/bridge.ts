@@ -126,7 +126,13 @@ export class PageBridge {
     return this.readyPromise;
   }
 
-  async call<T = any>(method: string, params?: any): Promise<T> {
+  /**
+   * 调用页面钩子。
+   *
+   * timeoutMs 可以单独放宽 —— 像「解析一条笔记」这种天然就慢的调用，
+   * 用默认的 15s 会在它自己算好的预算用完之前就被砍掉。
+   */
+  async call<T = any>(method: string, params?: any, timeoutMs?: number): Promise<T> {
     await this.ready();
     const id = `c${++this.seq}`;
     const channel = this.channel!;
@@ -135,7 +141,7 @@ export class PageBridge {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`调用超时: ${method}`));
-      }, this.timeoutMs);
+      }, timeoutMs ?? this.timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
       window.postMessage({ __rednote: channel, id, method, params }, '*');

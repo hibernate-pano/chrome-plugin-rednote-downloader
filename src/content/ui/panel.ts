@@ -1213,12 +1213,14 @@ export class Panel {
     const status = cardStatusHtml(p);
     if (status) {
       refs.meta.innerHTML = status;
-    } else if (card.likedCount) {
-      refs.meta.textContent = `${card.likedCount} 赞`;
     } else if (card.resolving) {
+      // 「解析中」和「解析失败」都要排在「赞」前面 ——
+      // 赞数只是个装饰，把失败盖住的话用户根本不知道这条没解析出来
       refs.meta.innerHTML = `<span class="rn-resolving">${icon('spinner', 11)}解析中…</span>`;
     } else if (card.failed) {
       refs.meta.innerHTML = '<span class="rn-err">解析失败</span>';
+    } else if (card.likedCount) {
+      refs.meta.textContent = `${card.likedCount} 赞`;
     } else {
       refs.meta.textContent = card.resolved ? '' : '待解析';
     }

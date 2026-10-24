@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { sanitizeSegment, sanitizeStem, buildSafeFileName, renderTemplate, guessExtension, formatBytes, matchesMediaFilter, filterByMediaFilter, mediaFilterLabel, effectiveTemplate, saveStructureLabel, saveStructureName } from '../src/shared/utils';
-import { originalImageUrl, jpegImageUrl, extractNote, extractNoteFromState, titleFromDesc } from '../src/content/detect/raw';
+import { originalImageUrl, jpegImageUrl, extractNote, extractNoteFromState, hasMedia, parseInitialState, titleFromDesc } from '../src/content/detect/raw';
 import { buildFileName, buildRelativePath, noteToMediaItems } from '../src/content/detect/media';
 import { DEFAULT_SETTINGS } from '../src/shared/types';
 
@@ -509,4 +509,146 @@ test('formatBytes：体积可读', () => {
   assert.equal(formatBytes(0), '0 B');
   assert.equal(formatBytes(1024), '1.0 KB');
   assert.equal(formatBytes(11366919), '10.8 MB');
+});
+
+/* ------------------------------------------------------------------ */
+/* 页面状态里内联的 __INITIAL_STATE__                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 真站点抓下来的状态片段（2026-10-24，www.xiaohongshu.com/explore）。
+ *
+ * 关键点：**它不是 JSON，是 JavaScript 对象字面量** ——
+ * 里面有 29 处 `undefined`，直接 `JSON.parse` 一定抛错。
+ * 这条规则一旦回归，抓 HTML 那条快路就全废了（每条笔记白打一个请求，
+ * 还会跟 iframe 抢连接池，把解析成功率拖下去）。
+ */
+const REAL_STATE_SNIPPET = `<script>window.__INITIAL_STATE__ = {
+  "note": {
+    "prevRouteData": {},
+    "prevRoute": "Empty",
+    "commentTarget": {},
+    "isImgFullscreen": false,
+    "gotoPage": "",
+    "firstNoteId": "",
+    "autoOpenNote": false,
+    "topCommentId": "",
+    "highlightDescTexts": [],
+    "noteDetailMap": {},
+    "serverRequestInfo": { "state": "success", "errorCode": 0, "errMsg": "" },
+    "volume": 0,
+    "recommendVideoMap": {},
+    "videoFeedType": "note_source",
+    "rate": 1,
+    "currentNoteId": undefined,
+    "forceScrollToComment": false,
+    "mediaWidth": 450,
+    "noteHeight": 800,
+    "redFirstNoteId": ""
+  },
+  "nioStore": { "collectionListDataSource": undefined, "error": undefined },
+  "groupData": { "error": null }
+};</script>`;
+
+test('parseInitialState：真站点的状态（带 undefined）能解出来', () => {
+  const state = parseInitialState(REAL_STATE_SNIPPET);
+  assert.ok(state, '带 undefined 的状态必须能解出来');
+  assert.equal(state.note.noteDetailMap && typeof state.note.noteDetailMap, 'object');
+  assert.equal(state.note.currentNoteId, null, 'undefined 应该变成 null');
+  assert.equal(state.note.mediaWidth, 450);
+  assert.equal(state.note.videoFeedType, 'note_source');
+  assert.equal(state.nioStore.error, null);
+  assert.equal(state.groupData.error, null);
+});
+
+test('parseInitialState：字符串里的 undefined 不能被改掉', () => {
+  const html = `<script>window.__INITIAL_STATE__ = {"a":"undefined","b":"x undefined y","c":undefined};</script>`;
+  const state = parseInitialState(html);
+  assert.ok(state);
+  assert.equal(state.a, 'undefined', '字符串 "undefined" 要原样保留');
+  assert.equal(state.b, 'x undefined y');
+  assert.equal(state.c, null);
+});
+
+test('parseInitialState：字符串里的花括号不能把扫描带偏', () => {
+  const html = `<script>window.__INITIAL_STATE__ = {"a":"}{","b":{"c":1},"d":"}"};</script>`;
+  const state = parseInitialState(html);
+  assert.ok(state, '括号在字符串里也不能影响配平扫描');
+  assert.equal(state.a, '}{');
+  assert.equal(state.b.c, 1);
+  assert.equal(state.d, '}');
+});
+
+test('parseInitialState：NaN 与 Infinity 当成 null', () => {
+  const html = `<script>window.__INITIAL_STATE__ = {"a":NaN,"b":Infinity,"c":-Infinity};</script>`;
+  const state = parseInitialState(html);
+  assert.ok(state);
+  assert.equal(state.a, null);
+  assert.equal(state.b, null);
+  assert.equal(state.c, null);
+});
+
+test('parseInitialState：没有状态就返回 null（不抛错）', () => {
+  assert.equal(parseInitialState('<html><body>404</body></html>'), null);
+  assert.equal(parseInitialState('<script>window.__INITIAL_STATE__ = </script>'), null);
+});
+
+test('hasMedia：空壳笔记（只有 id 没有媒体）不算有内容', () => {
+  // 页面状态是先有 id、标题，媒体后补 —— 早一步读到就是这个形状
+  const shell = extractNoteFromState(
+    {
+      note: {
+        noteDetailMap: {
+          abc123: { note: { noteId: 'abc123', type: 'video', title: '标题' } },
+        },
+      },
+    },
+    'abc123',
+  );
+  assert.ok(shell, '空壳也能取出笔记对象');
+  assert.equal(shell.videos.length, 0);
+  assert.equal(shell.images.length, 0);
+  assert.equal(hasMedia(shell), false, '空壳不能算解析成功');
+});
+
+test('hasMedia：有视频或有图片才算有内容', () => {
+  const withVideo = extractNoteFromState(
+    {
+      note: {
+        noteDetailMap: {
+          v1: {
+            note: {
+              noteId: 'v1',
+              type: 'video',
+              title: 't',
+              video: { media: { stream: { h264: [{ masterUrl: 'https://x/a.mp4' }] } } },
+            },
+          },
+        },
+      },
+    },
+    'v1',
+  );
+  assert.ok(withVideo);
+  assert.equal(hasMedia(withVideo), true);
+
+  const withImage = extractNoteFromState(
+    {
+      note: {
+        noteDetailMap: {
+          i1: {
+            note: {
+              noteId: 'i1',
+              type: 'normal',
+              title: 't',
+              imageList: [{ fileId: 'f', urlDefault: 'https://x/a.jpg' }],
+            },
+          },
+        },
+      },
+    },
+    'i1',
+  );
+  assert.ok(withImage);
+  assert.equal(hasMedia(withImage), true);
 });
