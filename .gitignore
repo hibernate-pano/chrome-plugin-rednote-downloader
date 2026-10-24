@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+.DS_Store
+*.log
+
+# 调研与工具的临时产物，不属于产品代码
+.playwright-mcp/
+.research/
+.pi/

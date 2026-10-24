@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>小红书下载器 · 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="hd">
+        <span class="hd-logo" id="logo"></span>
+        <div>
+          <h1>小红书下载器</h1>
+          <p class="hd-sub">设置下载方式、命名规则与面板偏好</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2 class="card-title">下载内容</h2>
+
+        <label class="row">
+          <span class="row-label">文件类型筛选</span>
+          <span class="row-hint">
+            只下视频或只下图片（视频笔记的封面算图片）
+          </span>
+          <div class="seg" id="seg-downloadFilter">
+            <button type="button" data-value="all">全部</button>
+            <button type="button" data-value="video">仅视频</button>
+            <button type="button" data-value="image">仅图片</button>
+          </div>
+        </label>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">保存位置</h2>
+
+        <label class="row">
+          <span class="row-label">根文件夹</span>
+          <span class="row-hint">相对于浏览器的下载目录</span>
+          <input type="text" id="rootFolder" class="input" placeholder="小红书下载" />
+        </label>
+
+        <label class="row">
+          <span class="row-label">保存结构</span>
+          <span class="row-hint" id="saveStructureHint">
+            每篇笔记一个文件夹 / 同一作者放一个文件夹 / 全部平铺在主文件夹
+          </span>
+          <div class="seg" id="seg-saveStructure">
+            <button type="button" data-value="perNote">按笔记</button>
+            <button type="button" data-value="perAuthor">按作者</button>
+            <button type="button" data-value="flat">全部平铺</button>
+          </div>
+        </label>
+
+        <label class="row">
+          <span class="row-label">并发下载数</span>
+          <span class="row-hint">同时进行的下载任务数量</span>
+          <div class="seg" id="seg-concurrency">
+            <button type="button" data-value="1">1</button>
+            <button type="button" data-value="3">3</button>
+            <button type="button" data-value="5">5</button>
+          </div>
+        </label>
+
+        <label class="row">
+          <span class="row-label">图片格式</span>
+          <span class="row-hint">JPG 兼容性最好；原图保留原始画质与格式</span>
+          <div class="seg" id="seg-imageFormat">
+            <button type="button" data-value="jpeg">JPG</button>
+            <button type="button" data-value="original">原图</button>
+          </div>
+        </label>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">文件命名</h2>
+
+        <label class="row col">
+          <span class="row-label">
+            命名模板
+            <em class="row-tag" id="templateScope">按笔记</em>
+          </span>
+          <input type="text" id="fileNameTemplate" class="input" placeholder="{author}_{title}_{index}" />
+          <span class="row-hint">
+            可用变量：<code>{author}</code> <code>{title}</code> <code>{index}</code>
+            <code>{ext}</code>
+          </span>
+        </label>
+
+        <div class="preview" id="preview"></div>
+
+        <div class="quick" id="quickTemplates">
+          <span class="row-hint">快捷模板：</span>
+          <button type="button" data-tpl="{index}">仅序号</button>
+          <button type="button" data-tpl="{title}_{index}">标题_序号</button>
+          <button type="button" data-tpl="{author}_{title}_{index}">作者_标题_序号</button>
+          <button type="button" data-tpl="{author}_{title}">作者_标题</button>
+          <button type="button" data-tpl="{title}">仅标题</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">扫描与面板</h2>
+
+        <label class="row">
+          <span class="row-label">扫描主页时自动滚动</span>
+          <span class="row-hint">自动下拉加载更多笔记</span>
+          <input type="checkbox" id="autoScrollScan" class="switch" />
+        </label>
+
+        <label class="row">
+          <span class="row-label">最大扫描轮数</span>
+          <span class="row-hint">每轮约加载 30 条笔记</span>
+          <input type="number" id="maxScrollRounds" class="input num" min="1" max="200" step="1" />
+        </label>
+
+        <label class="row">
+          <span class="row-label">在笔记上悬停显示下载按钮</span>
+          <span class="row-hint">主页里悬停卡片即可一键下载</span>
+          <input type="checkbox" id="showHoverButton" class="switch" />
+        </label>
+
+        <label class="row">
+          <span class="row-label">面板主题</span>
+          <span class="row-hint">跟随系统或手动指定</span>
+          <div class="seg" id="seg-theme">
+            <button type="button" data-value="auto">跟随系统</button>
+            <button type="button" data-value="light">浅色</button>
+            <button type="button" data-value="dark">深色</button>
+          </div>
+        </label>
+
+        <label class="row">
+          <span class="row-label">下载完成后发送系统通知</span>
+          <span class="row-hint">批量下载结束时提醒你</span>
+          <input type="checkbox" id="notifyOnComplete" class="switch" />
+        </label>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">关于</h2>
+        <p class="about">
+          本工具仅下载你在小红书网页上主动查看的内容，用于个人收藏与备份。
+          请尊重内容作者的版权，勿用于二次分发或商业用途。
+        </p>
+        <div class="about-meta">
+          <span>版本 <b id="version">1.0.0</b></span>
+          <span class="dot">·</span>
+          <span>仅在 xiaohongshu.com 上运行</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="toast" id="toast" role="status"></div>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>小红书下载器</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="hd">
+      <div class="hd-brand">
+        <span class="hd-logo" id="logo"></span>
+        <span class="hd-name">小红书下载器</span>
+      </div>
+      <button class="hd-icon" id="btn-options" title="设置" aria-label="设置"></button>
+    </header>
+
+    <section class="card" id="current-card">
+      <div class="card-label">当前页面</div>
+      <div class="current" id="current">
+        <div class="current-thumb" id="current-thumb"></div>
+        <div class="current-info">
+          <div class="current-title" id="current-title">读取中…</div>
+          <div class="current-sub" id="current-sub"></div>
+        </div>
+      </div>
+      <button class="btn btn-primary" id="btn-open" hidden>打开下载面板</button>
+    </section>
+
+    <section class="stats" id="stats" hidden>
+      <div class="stats-num" id="stats-num">0</div>
+      <div class="stats-label" id="stats-label">本次会话已下载 0 个文件</div>
+    </section>
+
+    <section class="prefs">
+      <label class="pref">
+        <input type="checkbox" id="opt-hover" />
+        <span>在笔记上悬停时显示下载按钮</span>
+      </label>
+      <label class="pref">
+        <input type="checkbox" id="opt-notify" />
+        <span>下载完成后发送系统通知</span>
+      </label>
+    </section>
+
+    <footer class="ft">
+      <span class="ft-item" id="ft-help">使用帮助</span>
+      <span class="ft-sep"></span>
+      <span class="ft-item" id="ft-version">v1.0.0</span>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "name": "rednote-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "小红书内容下载器 — Chrome 扩展",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build",
+    "pretest": "esbuild tests/core.test.ts --bundle --format=esm --platform=node --outfile=build/test/core.test.mjs --log-level=error && esbuild tests/downloader.test.ts --bundle --format=esm --platform=node --outfile=build/test/downloader.test.mjs --log-level=error && esbuild src/background/downloader.ts --bundle --format=esm --platform=node --outfile=build/test/_downloader.mjs --log-level=error",
+    "test": "node --test \"build/test/*.test.mjs\"",
+    "e2e": "npm run build && node scripts/e2e.mjs && node scripts/e2e-batch.mjs",
+    "e2e:batch": "npm run build && node scripts/e2e-batch.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  }
+}
