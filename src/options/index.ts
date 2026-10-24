@@ -1,4 +1,4 @@
-import { MSG, type DirectoryState } from '../shared/messages';
+import { MSG } from '../shared/messages';
 import type { DownloadMode, SaveStructure, Settings } from '../shared/types';
 import { DEFAULT_SETTINGS } from '../shared/types';
 import {
@@ -9,7 +9,6 @@ import {
 } from '../shared/utils';
 import { buildFileName } from '../content/detect/media';
 import { logoSvg } from '../content/ui/icons';
-import { clearRootHandle, getRootHandle, queryPermission, setRootHandle } from '../shared/fs-store';
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -25,38 +24,6 @@ function sendMessage<T>(message: unknown, timeoutMs = 4000): Promise<T> {
       setTimeout(() => reject(new Error('后台服务没有响应，请重新加载扩展')), timeoutMs),
     ),
   ]);
-}
-
-/** 当前保存目录的状态 */
-let directory: DirectoryState | undefined;
-
-async function loadDirectory(): Promise<void> {
-  try {
-    const res = await sendMessage<{ state?: DirectoryState }>({ type: MSG.GET_DIRECTORY_STATE });
-    directory = res?.state;
-  } catch {
-    directory = undefined;
-  }
-}
-
-/** 目录那一行的显示：设了没、叫什么、授权还在不在 */
-function renderDirectory(): void {
-  const hint = $('directoryHint');
-  const row = $('row-directory');
-  const clear = $<HTMLButtonElement>('btn-clear-dir');
-  if (!directory?.hasDirectory) {
-    hint.textContent = '还没有选择文件夹 —— 下载时会弹出窗口让你选一次';
-    row.classList.remove('hidden');
-    clear.hidden = true;
-    return;
-  }
-  if (directory.permission === 'granted') {
-    hint.textContent = `当前：${directory.name ?? '已选择'}`;
-  } else {
-    hint.textContent = `当前：${directory.name ?? '已选择'}（需要重新授权才能继续写入）`;
-  }
-  row.classList.remove('hidden');
-  clear.hidden = false;
 }
 
 async function load(): Promise<void> {
@@ -191,9 +158,7 @@ async function init(): Promise<void> {
   showHoverButton.checked = settings.showHoverButton;
   notifyOnComplete.checked = settings.notifyOnComplete;
 
-  await loadDirectory();
   markSegment('seg-downloadMode', settings.downloadMode);
-  renderDirectory();
 
   markSegment('seg-concurrency', String(settings.concurrency));
   markSegment('seg-theme', settings.theme);
@@ -227,37 +192,8 @@ async function init(): Promise<void> {
   });
   bindSegment('seg-downloadMode', (value) => {
     const mode = value as DownloadMode;
-    void save({ downloadMode: mode }).then(() => {
-      renderDirectory();
-    });
+    void save({ downloadMode: mode });
     toast('已保存');
-  });
-
-  $<HTMLButtonElement>('btn-pick-dir').addEventListener('click', () => {
-    // showDirectoryPicker 要求用户手势，必须在点击回调里第一件事就调
-    void window
-      .showDirectoryPicker({ mode: 'readwrite', id: 'rednote-downloads', startIn: 'downloads' })
-      .then(async (handle) => {
-        await setRootHandle(handle);
-        await chrome.runtime.sendMessage({ type: MSG.DIRECTORY_READY, name: handle.name });
-        await loadDirectory();
-        renderDirectory();
-        toast(`已保存到「${handle.name}」`);
-      })
-      .catch((err: unknown) => {
-        if (err instanceof Error && err.name === 'AbortError') return;
-        toast(err instanceof Error ? err.message : String(err));
-      });
-  });
-
-  $<HTMLButtonElement>('btn-clear-dir').addEventListener('click', () => {
-    void (async () => {
-      await chrome.runtime.sendMessage({ type: MSG.CLEAR_DIRECTORY });
-      await clearRootHandle();
-      await loadDirectory();
-      renderDirectory();
-      toast('已清除');
-    })();
   });
 
   bindSegment('seg-saveStructure', (value) => {

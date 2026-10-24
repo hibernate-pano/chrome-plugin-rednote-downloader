@@ -105,6 +105,15 @@ export interface DownloadTaskItem {
   author?: string;
 }
 
+/** 打包时的一个文件（zip 模式用） */
+export interface PackItem {
+  itemId: string;
+  url: string;
+  /** 包内的相对路径，例如 `昵称/标题/01.jpg` */
+  path: string;
+  size?: number;
+}
+
 export type DownloadState =
   | 'queued'
   | 'downloading'
@@ -149,20 +158,20 @@ export interface DownloadTaskSnapshot {
 }
 
 /**
- * 下载方式 —— 决定「谁来把文件写到磁盘上」。
+ * 下载方式 —— 决定「文件怎么落到磁盘上」。
  *
- * - self：扩展自己取字节、自己写文件（File System Access API）。
- *   浏览器里不会留下任何下载记录，也没有浏览器的下载栏；
- *   代价是用户要先选一次保存目录。
- * - browser：走 Chrome 的下载管理器。零配置，但每个文件会在浏览器里
- *   留下一条下载记录，批量时界面也会被下载栏占掉。
+ * - browser：交给 Chrome 的下载管理器，一个文件一条下载记录。
+ *   零配置，最省心；文件特别多时，浏览器要处理几百次下载事件，会明显变卡。
+ * - zip：扩展先把内容打成一个压缩包，再交给 Chrome 下载 ——
+ *   浏览器只处理一次下载，几百个文件也只占一个文件。
+ *   代价是用户要先等打包完成。
  */
-export type DownloadMode = 'self' | 'browser';
+export type DownloadMode = 'browser' | 'zip';
 
 export interface Settings {
   /** 并发下载数 */
   concurrency: number;
-  /** 下载方式：自己写盘 / 交给浏览器下载 */
+  /** 下载方式：交给浏览器 / 打包成一个 zip */
   downloadMode: DownloadMode;
   /** 保存结构：每篇笔记一个独立文件夹 / 按作者分文件夹 / 全部平铺在主文件夹 */
   saveStructure: SaveStructure;
@@ -192,7 +201,7 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   concurrency: 3,
-  downloadMode: 'self',
+  downloadMode: 'browser',
   saveStructure: 'perNote',
   fileNameTemplate: '{index}',
   perAuthorFileNameTemplate: '{title}_{index}',

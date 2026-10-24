@@ -54,8 +54,6 @@ export interface NoteViewModel {
   mediaFilter: MediaFilter;
   /** 保存结构：每篇笔记一个独立文件夹，还是全部放进主文件夹 */
   saveStructure: SaveStructure;
-  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
-  saveLocation?: string;
 }
 
 export interface BatchViewModel {
@@ -77,8 +75,6 @@ export interface BatchViewModel {
   resolving: boolean;
   /** 批量解析进度 */
   resolveInfo?: { done: number; total: number; failed: number };
-  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
-  saveLocation?: string;
 }
 
 export interface PanelCallbacks {
@@ -217,22 +213,9 @@ function ringSvg(pct: number): string {
 /* ------------------------------------------------------------------ */
 
 export class Panel {
-  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
-  private saveLocation?: string;
-
-  /**
-   * 告诉面板文件存在哪 —— 决定「打开」按钮说的是保存位置还是下载列表。
-   *
-   * 只重画页脚，不重建整块网格：重建会把几十张缩略图重新解码一次，
-   * 正好发生在用户刚开始下载的时候，闪一下很难看。
-   */
-  setSaveLocation(location?: string): void {
-    this.saveLocation = location;
-    const vm = this.lastBatchVm;
-    if (!vm) return;
-    vm.saveLocation = location;
-    this.renderBatchFooter(vm);
-  }
+  /** 主页头部的两行文字：只改文字，不重建网格时用 */
+  private batchHeadTitle?: HTMLElement;
+  private batchHeadSub?: HTMLElement;
 
   private host!: HTMLElement;
   private shadow!: ShadowRoot;
@@ -741,12 +724,7 @@ export class Panel {
       const btn = el('button', 'rn-btn');
       btn.type = 'button';
       btn.dataset.variant = 'text';
-      btn.setAttribute(
-        'aria-label',
-        this.saveLocation
-          ? `已保存到 ${this.saveLocation}`
-          : `打开浏览器下载列表：${item.filename}`,
-      );
+      btn.setAttribute('aria-label', `打开浏览器下载列表：${item.filename}`);
       btn.innerHTML = icon('folder', 15);
       btn.addEventListener('click', () => this.callbacks.onOpenDownloads());
       action.appendChild(btn);
@@ -963,20 +941,11 @@ export class Panel {
     title.id = 'rn-panel-title';
     title.textContent = vm.nickname || '用户主页';
     const sub = el('div', 'rn-head-sub');
-    const videoCount = vm.cards.filter((c) => c.type === 'video').length;
-    const imageCount = vm.cards.filter((c) => c.type === 'image').length;
-    if (vm.phase === 'scanning') {
-      sub.textContent = `正在扫描这个账号的公开笔记…（已发现 ${vm.scanInfo?.found ?? 0} 条）`;
-    } else if (vm.phase === 'blocked') {
-      sub.textContent = '需要登录才能扫描这个账号的完整笔记';
-    } else if (vm.cards.length === 0) {
-      sub.textContent = '没有识别到笔记';
-    } else if (vm.resolving && vm.resolveInfo) {
-      const r = vm.resolveInfo;
-      sub.textContent = `正在解析 ${r.done}/${r.total} 条笔记${r.failed ? `（${r.failed} 条失败）` : ''}`;
-    } else {
-      sub.textContent = `已扫描 ${vm.cards.length} 条笔记（视频 ${videoCount} / 图集 ${imageCount}）`;
-    }
+    // 存一份引用：解析几百条笔记时只改这两行文字，
+    // 不重新画整张网格（整张网格重建 = 几百张缩略图重新解码）
+    this.batchHeadSub = sub;
+    this.batchHeadTitle = title;
+    this.updateBatchHeader(vm);
     text.append(title, sub);
     this.header.appendChild(text);
     this.header.append(this.buildHeadActions());
@@ -1354,6 +1323,48 @@ export class Panel {
     this.renderBatchFooter(vm);
   }
 
+  /**
+   * 只改主页头部的那行说明文字。
+   *
+   * 解析进度每解析一条就变一次 —— 走这条路只是改两个 textContent，
+   * 不碰网格里的任何一张卡片。
+   */
+  private updateBatchHeader(vm: BatchViewModel): void {
+    const sub = this.batchHeadSub;
+    if (!sub) return;
+    const videoCount = vm.cards.filter((c) => c.type === 'video').length;
+    const imageCount = vm.cards.filter((c) => c.type === 'image').length;
+    if (vm.phase === 'scanning') {
+      sub.textContent = `正在扫描这个账号的公开笔记…（已发现 ${vm.scanInfo?.found ?? 0} 条）`;
+    } else if (vm.phase === 'blocked') {
+      sub.textContent = '需要登录才能扫描这个账号的完整笔记';
+    } else if (vm.cards.length === 0) {
+      sub.textContent = '没有识别到笔记';
+    } else if (vm.resolving && vm.resolveInfo) {
+      const r = vm.resolveInfo;
+      sub.textContent = `正在解析 ${r.done}/${r.total} 条笔记${r.failed ? `（${r.failed} 条失败）` : ''}`;
+    } else {
+      sub.textContent = `已扫描 ${vm.cards.length} 条笔记（视频 ${videoCount} / 图集 ${imageCount}）`;
+    }
+  }
+
+  /**
+   * 解析进度更新：只补画刚变的那几张卡片。
+   *
+   * 以前每解析完一条笔记就把整张网格重画一遍（body.innerHTML = '' 再重建），
+   * 几百条笔记时 = 几百次 × 几百张卡片，缩略图每次都要重新解码 ——
+   * 主线程被渲染占满，解析本身也跟着卡住。
+   */
+  patchBatchResolve(vm: BatchViewModel, noteIds: string[]): void {
+    for (const noteId of noteIds) {
+      const refs = this.cardNodes.get(noteId);
+      if (!refs) continue;
+      this.paintCard(refs, vm);
+    }
+    this.updateBatchHeader(vm);
+    this.renderBatchFooter(vm);
+  }
+
   private renderBatchFooter(vm: BatchViewModel): void {
     this.footer.innerHTML = '';
     const info = el('div', 'rn-footer-info');
@@ -1396,13 +1407,8 @@ export class Panel {
 
       const openList = el('button', 'rn-btn');
       openList.type = 'button';
-      openList.innerHTML = vm.saveLocation
-        ? `${icon('folder', 15)}保存位置`
-        : `${icon('folder', 15)}下载列表`;
-      openList.setAttribute(
-        'aria-label',
-        vm.saveLocation ? `保存位置：${vm.saveLocation}` : '打开浏览器下载列表',
-      );
+      openList.innerHTML = `${icon('folder', 15)}下载列表`;
+      openList.setAttribute('aria-label', '打开浏览器下载列表');
       openList.addEventListener('click', () => this.callbacks.onOpenDownloads());
       this.footer.appendChild(openList);
 
@@ -1440,10 +1446,6 @@ export class Panel {
     } else {
       title.textContent = '请选择要下载的内容';
       sub.textContent = `共 ${vm.cards.length} 条笔记`;
-    }
-    // 自己写盘时把保存位置挂在副标题上 —— 用户随时能确认文件会落在哪
-    if (vm.saveLocation) {
-      sub.textContent += ` · 保存到 ${vm.saveLocation}`;
     }
     info.append(title, sub);
 

@@ -12,9 +12,9 @@ const entryPoints = {
   content: path.join(root, 'src/content/index.ts'),
   'page-hook': path.join(root, 'src/content/page-hook.ts'),
   background: path.join(root, 'src/background/index.ts'),
+  offscreen: path.join(root, 'src/offscreen/index.ts'),
   popup: path.join(root, 'src/popup/index.ts'),
   options: path.join(root, 'src/options/index.ts'),
-  picker: path.join(root, 'src/picker/index.ts'),
 };
 
 const common = {

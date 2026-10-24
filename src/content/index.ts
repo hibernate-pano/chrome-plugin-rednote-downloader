@@ -2,7 +2,7 @@ import { PageBridge } from './bridge';
 import { Detector, classifyPage, type PageKind } from './detect/detector';
 import { buildRelativePath, fileNameForItem } from './detect/media';
 import type { RawNoteRef } from './detect/raw';
-import { MSG, type DirectoryState } from '../shared/messages';
+import { MSG } from '../shared/messages';
 import type {
   DownloadProgress,
   DownloadTaskItem,
@@ -63,8 +63,6 @@ class App {
   private mediaFilter: MediaFilter = 'all';
   /** 保存结构：每篇笔记一个独立文件夹，还是全部放进主文件夹 */
   private saveStructure: SaveStructure = 'perNote';
-  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
-  private saveLocation?: string;
 
   constructor() {
     this.detector = new Detector({
@@ -155,9 +153,6 @@ class App {
         }
       }
     });
-
-    // 扩展自己写盘时，面板要显示文件存在哪
-    void this.loadDirectoryState();
 
     // 首次使用引导
     void this.maybeShowCoachMark();
@@ -281,7 +276,6 @@ class App {
       progress: this.progressMap,
       mediaFilter: this.mediaFilter,
       saveStructure: this.saveStructure,
-      saveLocation: this.saveLocation,
     };
     this.panel.renderNote(vm);
   }
@@ -341,7 +335,6 @@ class App {
       selected: new Set(),
       progress: new Map(),
       resolving: false,
-      saveLocation: this.saveLocation,
     };
     this.batchTaskId = undefined;
     this.batchStarted = false;
@@ -442,6 +435,7 @@ class App {
           });
 
           card.resolving = false;
+          this.queueBatchPatch(card.noteId);
           if (detail) {
             card.resolved = true;
             card.mediaCount = detail.items.length;
@@ -458,7 +452,8 @@ class App {
         resolved.set(noteId, card);
 
         info.done += 1;
-        this.scheduleBatchRender();
+        // 只补画刚变的那张卡片 —— 整张网格重画几百次会把主线程占满
+        this.queueBatchPatch(noteId);
       }
     };
 
@@ -543,6 +538,28 @@ class App {
    * 批量解析期间网格会连续变化，但每次重建整张网格代价不小（图片会重新挂载）。
    * 所以节流到 150ms 一次，用户看起来仍然是实时更新。
    */
+  /**
+   * 解析进度：攒一批 noteId，合并成一次补画。
+   *
+   * 解析几百条笔记时，每条都会变一次卡片状态。
+   * 整张网格重画（几百张卡片 + 几百张缩略图重新解码）会把主线程占满，
+   * 解析本身都被拖慢；只补画变了的卡片就没有这个问题。
+   */
+  private batchPatchQueue = new Set<string>();
+  private batchPatchTimer: number | undefined;
+
+  private queueBatchPatch(noteId: string): void {
+    this.batchPatchQueue.add(noteId);
+    if (this.batchPatchTimer !== undefined) return;
+    this.batchPatchTimer = window.setTimeout(() => {
+      this.batchPatchTimer = undefined;
+      const ids = [...this.batchPatchQueue];
+      this.batchPatchQueue.clear();
+      if (ids.length === 0) return;
+      this.panel.patchBatchResolve(this.batch, ids);
+    }, 200);
+  }
+
   private batchRenderTimer: number | undefined;
 
   private scheduleBatchRender(): void {
@@ -616,25 +633,8 @@ class App {
     );
   }
 
-  /**
-   * 「打开下载」的落点。
-   *
-   * 走浏览器下载时是 Chrome 的下载列表；
-   * 扩展自己写盘时浏览器里根本没有下载记录 —— 那就告诉用户文件存在哪。
-   */
+  /** 「打开下载」：跳到 Chrome 的下载列表 */
   private async openDownloads(): Promise<void> {
-    if (this.saveLocation) {
-      this.toast.show({
-        title: `文件保存在「${this.saveLocation}」`,
-        body: '在设置里可以随时更换',
-        tone: 'info',
-        action: {
-          label: '去设置',
-          onClick: () => void chrome.runtime.sendMessage({ type: MSG.OPEN_OPTIONS }),
-        },
-      });
-      return;
-    }
     await chrome.runtime.sendMessage({ type: 'SHOW_DOWNLOADS' });
   }
 
@@ -651,11 +651,7 @@ class App {
   }
 
   private onProgress(list: DownloadProgress[]): void {
-    // 条目从「等目录」变成别的状态 = 用户刚选好保存目录，刷新一下面板上的保存位置
-    let directoryChanged = false;
     for (const progress of list) {
-      const prev = this.progressMap.get(progress.itemId);
-      if (prev?.state === 'waiting' && progress.state !== 'waiting') directoryChanged = true;
       this.progressMap.set(progress.itemId, progress);
       if (progress.taskId === this.batchTaskId) {
         this.batch.progress.set(progress.itemId, progress);
@@ -678,8 +674,6 @@ class App {
     const total = all.length;
     const pct = total > 0 ? Math.round((settled / total) * 100) : 0;
 
-    if (directoryChanged) void this.loadDirectoryState();
-
     this.panel.setFabBackgroundProgress(running > 0 || settled < total ? pct : null);
 
     // 只补变化的那几行 / 那几张卡，不整块重画 ——
@@ -697,31 +691,6 @@ class App {
         });
       }
     }
-  }
-
-  /* --------------------------- 保存位置 --------------------------- */
-
-  /**
-   * 拉一次目录状态。
-   *
-   * 走浏览器下载时没有「保存位置」这回事，面板就还是原来的「下载列表」按钮。
-   */
-  private async loadDirectoryState(): Promise<void> {
-    try {
-      const res = await chrome.runtime.sendMessage({ type: MSG.GET_DIRECTORY_STATE });
-      const state = res?.state as DirectoryState | undefined;
-      // 目录名可能为空（比如某些实现返回的根目录），空名就当没设
-      this.applySaveLocation(state?.mode === 'self' && state.name ? state.name : undefined);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  private applySaveLocation(location?: string): void {
-    this.saveLocation = location;
-    this.panel.setSaveLocation(location);
-    this.batch.saveLocation = location;
-    if (this.pageKind === 'note') this.renderNote();
   }
 
   /* --------------------------- 其它 --------------------------- */

@@ -4,13 +4,13 @@ import type {
   DownloadState,
   DownloadTaskItem,
   DownloadTaskSnapshot,
+  PackItem,
   Settings,
   TaskSummary,
 } from '../shared/types';
 import { DEFAULT_SETTINGS } from '../shared/types';
-import type { HistoryEntry } from '../shared/messages';
-import { getWritableRoot } from '../shared/fs-store';
-import { downloadToFile } from './engine-self';
+import type { HistoryEntry, OffscreenToWorker } from '../shared/messages';
+import { sanitizeSegment } from '../shared/utils';
 
 const STATE_KEY = 'rednote.download.tasks';
 const STATS_KEY = 'rednote.session.stats';
@@ -53,16 +53,14 @@ const MAX_AUTO_RETRY = 2;
 interface TaskRecord {
   taskId: string;
   tabId?: number;
-  /** 这个任务用哪个引擎下载：自己写盘 / 交给浏览器 */
+  /** 这个任务用哪个引擎下载：交给浏览器 / 打包成一个 zip */
   engine: DownloadMode;
-  /** 正在等用户选保存目录 */
-  waiting: boolean;
   items: DownloadProgress[];
   queue: string[];
   /**
    * 在途条目：key → itemId。
    *
-   * key 带引擎前缀（d=浏览器下载 id，s=自研引擎的 itemId），
+   * key 带引擎前缀（d=浏览器下载 id，z=打包任务），
    * 这样两个引擎的在途条目能放在同一张表里互不干扰。
    * 一律用字符串：存进 storage.session 再读回来时数字会变成字符串，
    * 用数字当 key 会出现「删不掉」的幽灵条目。
@@ -81,13 +79,14 @@ interface TaskRecord {
   lastBroadcastAt: number;
   /** 上次全量同步时间：页面刷新后靠它把进度补齐 */
   lastFullSyncAt: number;
-}
-
-/** 自研引擎的取消开关：taskId:itemId → AbortController */
-const selfControllers = new Map<string, AbortController>();
-
-function selfKey(taskId: string, itemId: string): string {
-  return `${taskId}:${itemId}`;
+  /** zip 模式：包的名字（不含扩展名） */
+  packName?: string;
+  /** zip 模式：包已经交给浏览器下载的 id */
+  downloadId?: number;
+  /** zip 模式：打好的包（下载完了要删掉） */
+  packFiles?: { dirName: string; packNames: string[] };
+  /** zip 模式：包打算存到哪里（相对浏览器的下载目录） */
+  packPaths?: string[];
 }
 
 const tasks = new Map<string, TaskRecord>();
@@ -176,12 +175,11 @@ async function restore(): Promise<void> {
         const record: TaskRecord = {
           ...item,
           engine: (item.engine ?? 'browser') as DownloadMode,
-          waiting: Boolean(item.waiting),
           // 旧版本存的是数字 key，读回来是字符串，而且没有引擎前缀。
           // 这里统一补上 'd' 前缀，不然浏览器引擎认不出在途条目。
           running: new Map(
             (item.running ?? []).map(([key, value]: [unknown, string]) => [
-              typeof key === 'string' && (key.startsWith('d:') || key.startsWith('s:'))
+              typeof key === 'string' && (key.startsWith('d:') || key.startsWith('z:'))
                 ? key
                 : `d:${key}`,
               value,
@@ -339,17 +337,54 @@ export interface StartResult {
   waiting: boolean;
 }
 
+/**
+ * 打包模式下的「在途条目」占位 id。
+ *
+ * 打包模式下整批只有一次（或几次）浏览器下载 —— 用这个假 id 占位，
+ * 让下载进度能挂到任务上，被现有的进度刷新机制跟到。
+ */
+const ZIP_SLOT = '__zip__';
+
+/**
+ * 单个包的大小上限。
+ *
+ * 标准 zip（不带 ZIP64）单个文件不能超过 4GB，
+ * 几百个视频很容易超 —— 超了就分成几个包，宁可多几个也不生成解不开的文件。
+ */
+const MAX_PACK_BYTES = 2 * 1024 * 1024 * 1024;
+
+/** 只有一个文件时没什么好打包的，直接丢给浏览器下载 */
+function shouldPack(items: DownloadTaskItem[]): boolean {
+  return items.length > 1;
+}
+
+/** 包的名字：作者 + 时间。多个包时后面会加 -2、-3 */
+function buildPackName(items: DownloadTaskItem[]): string {
+  const author = items.find((item) => item.author)?.author?.trim();
+  const now = new Date();
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    '-',
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+  ].join('');
+  const who = author ? sanitizeSegment(author, 24) : '';
+  return who ? `小红书-${who}-${stamp}` : `小红书下载-${stamp}`;
+}
+
 export async function startDownloads(
   tabId: number | undefined,
   taskId: string,
   items: DownloadTaskItem[],
 ): Promise<StartResult> {
   const settings = await getSettings();
+  const pack = settings.downloadMode === 'zip' && shouldPack(items);
   const record: TaskRecord = {
     taskId,
     tabId,
-    engine: settings.downloadMode,
-    waiting: false,
+    engine: pack ? 'zip' : 'browser',
     items: items.map((item) => ({
       taskId,
       itemId: item.itemId,
@@ -380,18 +415,9 @@ export async function startDownloads(
   // 页面得先知道一共要下多少个，进度才有分母
   await broadcast(record, true);
 
-  // 自研引擎需要用户先选好保存目录；没选就先把任务挂起，
-  // 由上层弹出选目录窗口，用户选完再继续
-  if (record.engine === 'self' && !(await getWritableRoot())) {
-    record.waiting = true;
-    // 队列要清空：目录选好后 onDirectoryReady 会把这些条目重新入队。
-    // 不清的话同一个条目会在队列里出现两次，文件会被下两遍。
-    record.queue = [];
-    for (const item of record.items) item.state = 'waiting';
-    record.dirty = new Set(record.items.map((i) => i.itemId));
-    await persist();
-    await broadcast(record, true);
-    return { waiting: true };
+  if (pack) {
+    await startPack(record, settings, items);
+    return { waiting: false };
   }
 
   await pump(record);
@@ -401,84 +427,311 @@ export async function startDownloads(
   return { waiting: false };
 }
 
+/* ------------------------------------------------------------------ */
+/* 打包                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 启动一次打包。
+ *
+ * 打包在后台页面（offscreen）里跑：Service Worker 空闲 30 秒就会被杀，
+ * 几百个文件的活儿扛不住；后台页面没有这个限制。
+ */
+async function startPack(
+  record: TaskRecord,
+  settings: Settings,
+  sources: DownloadTaskItem[],
+  suffix = '',
+): Promise<void> {
+  const packItems: PackItem[] = sources.map((source) => ({
+    itemId: source.itemId,
+    url: source.url,
+    // 包里的路径不要重复根文件夹 —— 包本身就是根
+    path: stripRootFolder(source.filename, settings.rootFolder),
+    size: source.size,
+  }));
+
+  for (const item of record.items) {
+    if (item.state === 'queued' || item.state === 'failed') {
+      item.state = 'downloading';
+      item.error = undefined;
+      item.bytesReceived = 0;
+    }
+    record.dirty.add(item.itemId);
+  }
+  record.engine = 'zip';
+  record.running.set('z:pack', 'pack');
+  record.packName = `${buildPackName(sources)}${suffix}`;
+  await broadcast(record, true);
+  await persist();
+
+  try {
+    // 后台页面得先开着（第一次用时才创建）
+    await ensureOffscreen();
+    const ok = await sendToOffscreen({
+      type: 'ZIP_START',
+      taskId: record.taskId,
+      items: packItems,
+      concurrency: settings.concurrency,
+      maxZipBytes: MAX_PACK_BYTES,
+      packName: record.packName,
+      rootFolder: sanitizeSegment(settings.rootFolder, 40),
+    });
+    if (!ok) throw new Error('后台页面启动失败');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    for (const item of record.items) {
+      if (item.state !== 'downloading') continue;
+      item.state = 'failed';
+      item.error = message;
+      record.summary.failed += 1;
+      record.dirty.add(item.itemId);
+    }
+    record.running.delete('z:pack');
+    await persist();
+    await broadcast(record, true);
+    await checkFinished(record);
+  }
+}
+
+/** 去掉路径最前面的根文件夹（包自己就是根） */
+function stripRootFolder(filename: string, rootFolder: string): string {
+  const root = sanitizeSegment(rootFolder, 40);
+  if (!root) return filename;
+  const prefix = `${root}/`;
+  return filename.startsWith(prefix) ? filename.slice(prefix.length) : filename;
+}
+
+/** 后台页面（offscreen）是否已经开着 */
+async function hasOffscreen(): Promise<boolean> {
+  try {
+    return await chrome.offscreen.hasDocument();
+  } catch {
+    return false;
+  }
+}
+
+/** 保证后台页面开着 */
+async function ensureOffscreen(): Promise<void> {
+  if (await hasOffscreen()) return;
+  try {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: [chrome.offscreen.Reason.BLOBS],
+      justification: '把打包好的压缩包交给浏览器的下载管理器保存到磁盘',
+    });
+  } catch (err) {
+    // 「已经有后台页面了」不算错
+    if (!/only a single offscreen/i.test(String(err))) throw err;
+  }
+}
+
+/**
+ * 给后台页面发消息。
+ *
+ * 刚创建的后台页面，脚本可能还没跑起来 —— 这时候发消息会收到
+ * 「没有接收端」。重试几次就好。
+ */
+async function sendToOffscreen(message: unknown): Promise<boolean> {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      const response = (await chrome.runtime.sendMessage(message)) as { ok?: boolean } | undefined;
+      if (response?.ok) return true;
+      return false;
+    } catch (err) {
+      const text = String(err);
+      if (!/receiving end|message port closed/i.test(text)) return false;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  return false;
+}
+
+/**
+ * 后台页面报回来的进度与结果。
+ */
+export async function handleOffscreenEvent(message: OffscreenToWorker): Promise<void> {
+  const record = tasks.get(message.taskId);
+  if (!record) return;
+
+  if (message.type === 'ZIP_ITEM_PROGRESS') {
+    const item = record.items.find((i) => i.itemId === message.itemId);
+    if (!item) return;
+    const now = Date.now();
+    item.bytesReceived = message.received;
+    if (message.total > 0) item.totalBytes = message.total;
+    const prev = record.lastTick.get(item.itemId) ?? { at: now, bytes: message.received };
+    const dt = (now - prev.at) / 1000;
+    if (dt >= 0.4) {
+      item.speed = Math.max(0, (message.received - prev.bytes) / dt);
+      record.lastTick.set(item.itemId, { at: now, bytes: message.received });
+    }
+    record.dirty.add(item.itemId);
+    schedulePersist();
+    void broadcast(record);
+    return;
+  }
+
+  if (message.type === 'ZIP_ITEM_DONE') {
+    const item = record.items.find((i) => i.itemId === message.itemId);
+    if (!item) return;
+    item.bytesReceived = Math.max(item.bytesReceived, message.bytes);
+    if (item.totalBytes <= 0) item.totalBytes = message.bytes;
+    item.speed = undefined;
+    record.dirty.add(item.itemId);
+    void broadcast(record);
+    return;
+  }
+
+  if (message.type === 'ZIP_ITEM_FAILED') {
+    const item = record.items.find((i) => i.itemId === message.itemId);
+    if (!item) return;
+    item.state = 'failed';
+    item.error = message.error;
+    item.speed = undefined;
+    record.summary.failed += 1;
+    record.dirty.add(item.itemId);
+    void broadcast(record);
+    return;
+  }
+
+  if (message.type === 'ZIP_FAILED') {
+    record.running.delete('z:pack');
+    for (const item of record.items) {
+      if (item.state !== 'downloading') continue;
+      item.state = 'failed';
+      item.error = message.error;
+      item.speed = undefined;
+      record.summary.failed += 1;
+      record.dirty.add(item.itemId);
+    }
+    record.queue = [];
+    await persist();
+    await broadcast(record, true);
+    await checkFinished(record);
+    return;
+  }
+
+  // ZIP_PACKS_READY：包打好了，交给浏览器下载
+  if (message.type === 'ZIP_PACKS_READY') {
+    await startPackDeliveries(record, message.packs);
+  }
+}
+
+/**
+ * 把打好的包交给 Chrome 的下载管理器。
+ *
+ * 整批只有一次（或几次）下载 —— 浏览器只处理这几条，
+ * 几百个文件也只占一两条下载记录。
+ */
+async function startPackDeliveries(
+  record: TaskRecord,
+  packs: { dirName: string; name: string; objectUrl: string; downloadPath: string }[],
+): Promise<void> {
+  record.running.delete('z:pack');
+  const started: number[] = [];
+  for (const pack of packs) {
+    try {
+      const downloadId = await chrome.downloads.download({
+        url: pack.objectUrl,
+        filename: pack.downloadPath,
+        conflictAction: 'uniquify',
+        saveAs: false,
+      });
+      started.push(downloadId);
+      record.running.set(`d:${downloadId}`, ZIP_SLOT);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      for (const item of record.items) {
+        if (item.state !== 'downloading') continue;
+        item.state = 'failed';
+        item.error = message;
+        record.summary.failed += 1;
+        record.dirty.add(item.itemId);
+      }
+    }
+  }
+  record.downloadId = started[0];
+  record.packFiles = {
+    dirName: packs[0]?.dirName ?? '',
+    packNames: packs.map((pack) => pack.name),
+  };
+  record.packPaths = packs.map((pack) => pack.downloadPath);
+  await persist();
+  await broadcast(record, true);
+  ensureHeartbeat();
+}
+
+/**
+ * 打包的最后一个包落盘了：把条目标记完成，让后台页面把临时文件删掉。
+ */
+async function finishPackTask(record: TaskRecord, dirName: string, packNames: string[]): Promise<void> {
+  for (const item of record.items) {
+    if (item.state !== 'downloading') continue;
+    item.state = 'completed';
+    item.speed = undefined;
+    record.summary.completed += 1;
+    record.dirty.add(item.itemId);
+    bumpSessionStats(item.bytesReceived);
+  }
+  record.queue = [];
+  await persist();
+  await broadcast(record, true);
+  // 让后台页面把 OPFS 里的临时包删掉（省磁盘）
+  void chrome.runtime
+    .sendMessage({ type: 'ZIP_CLEANUP', taskId: record.taskId, dirName, packNames })
+    .catch(() => undefined);
+  await checkFinished(record);
+}
+
 /**
  * 启动队列。
  *
  * 两个引擎在这里分流：浏览器引擎用 chrome.downloads.download 起步，
- * 自研引擎自己 fetch + 写文件。队列、并发、重试、统计的逻辑两边共用。
+ * 打包引擎已经把活儿交给后台页面了，这里只负责刷新界面。
+ * 队列、并发、重试、统计的逻辑两边共用。
  */
 async function pump(record: TaskRecord): Promise<void> {
   const settings = await getSettings();
   const limit = Math.max(1, Math.min(8, settings.concurrency));
 
-  // 还在等保存目录，先不启动任何下载
-  if (record.waiting) {
+  // 打包模式：进度由后台页面报回来，这里不碰队列
+  if (record.engine === 'zip') {
     ensureHeartbeat();
     await broadcast(record);
     return;
   }
 
-  if (record.engine === 'self') {
-    const root = await getWritableRoot();
-    if (!root) {
-      // 目录没了（用户撤销授权 / 换了目录）—— 挂起，等上层重新弹窗
-      record.waiting = true;
-      for (const item of record.items) {
-        if (item.state === 'queued') item.state = 'waiting';
-      }
-      record.queue = [];
-      record.dirty = new Set(record.items.map((i) => i.itemId));
-      ensureHeartbeat();
-      await persist();
-      await broadcast(record, true);
-      return;
-    }
-    while (record.running.size < limit && record.queue.length > 0) {
-      const itemId = record.queue.shift()!;
-      const item = record.items.find((i) => i.itemId === itemId);
-      if (!item) continue;
-      const source = record.sources.get(itemId);
-      if (!source) {
-        item.state = 'failed';
-        item.error = '任务数据丢失';
-        record.summary.failed += 1;
-        record.dirty.add(itemId);
-        continue;
-      }
-      startSelfItem(record, item, source, root);
-    }
-  } else {
-    while (record.running.size < limit && record.queue.length > 0) {
-      const itemId = record.queue.shift()!;
-      const item = record.items.find((i) => i.itemId === itemId);
-      if (!item) continue;
+  while (record.running.size < limit && record.queue.length > 0) {
+    const itemId = record.queue.shift()!;
+    const item = record.items.find((i) => i.itemId === itemId);
+    if (!item) continue;
 
-      const source = record.sources.get(itemId);
-      if (!source) {
-        item.state = 'failed';
-        item.error = '任务数据丢失';
-        record.summary.failed += 1;
-        record.dirty.add(itemId);
-        continue;
-      }
+    const source = record.sources.get(itemId);
+    if (!source) {
+      item.state = 'failed';
+      item.error = '任务数据丢失';
+      record.summary.failed += 1;
+      record.dirty.add(itemId);
+      continue;
+    }
 
-      try {
-        const downloadId = await chrome.downloads.download({
-          url: source.url,
-          filename: source.filename,
-          conflictAction: 'uniquify',
-          saveAs: false,
-        });
-        item.downloadId = downloadId;
-        item.state = 'downloading';
-        record.running.set(`d:${downloadId}`, itemId);
-        record.dirty.add(itemId);
-      } catch (err) {
-        item.state = 'failed';
-        item.error = err instanceof Error ? err.message : String(err);
-        record.summary.failed += 1;
-        record.dirty.add(itemId);
-      }
+    try {
+      const downloadId = await chrome.downloads.download({
+        url: source.url,
+        filename: source.filename,
+        conflictAction: 'uniquify',
+        saveAs: false,
+      });
+      item.downloadId = downloadId;
+      item.state = 'downloading';
+      record.running.set(`d:${downloadId}`, itemId);
+      record.dirty.add(itemId);
+    } catch (err) {
+      item.state = 'failed';
+      item.error = err instanceof Error ? err.message : String(err);
+      record.summary.failed += 1;
+      record.dirty.add(itemId);
     }
   }
 
@@ -486,196 +739,6 @@ async function pump(record: TaskRecord): Promise<void> {
   schedulePersist();
   await broadcast(record);
   await checkFinished(record);
-}
-
-/* ------------------------------------------------------------------ */
-/* 自研引擎                                                            */
-/* ------------------------------------------------------------------ */
-
-/**
- * 启动一个自研下载。
- *
- * 前半段是同步的：在途条目登记、状态置为「下载中」都在第一个 await 之前完成，
- * 所以调用方紧接着检查并发数时看到的计数是准的。
- */
-function startSelfItem(
-  record: TaskRecord,
-  item: DownloadProgress,
-  source: DownloadTaskItem,
-  root: FileSystemDirectoryHandle,
-): void {
-  const controller = new AbortController();
-  selfControllers.set(selfKey(record.taskId, item.itemId), controller);
-
-  item.state = 'downloading';
-  item.error = undefined;
-  record.running.set(`s:${item.itemId}`, item.itemId);
-  record.dirty.add(item.itemId);
-
-  const key = selfKey(record.taskId, item.itemId);
-
-  // 重试要等退避时间到了才重新入队。
-  // 退避期间这个条目仍然留在 running 里 —— 这样别的 pump 不会把它当成空闲名额抢走。
-  let retryScheduled = false;
-
-  void (async () => {
-    try {
-      const result = await downloadToFile({
-        root,
-        relPath: source.filename,
-        url: source.url,
-        signal: controller.signal,
-        onProgress: (received, total) => {
-          const now = Date.now();
-          item.bytesReceived = received;
-          if (total > 0) item.totalBytes = total;
-          const prev = record.lastTick.get(item.itemId) ?? { at: now, bytes: received };
-          const dt = (now - prev.at) / 1000;
-          if (dt >= 0.4) {
-            item.speed = Math.max(0, (received - prev.bytes) / dt);
-            record.lastTick.set(item.itemId, { at: now, bytes: received });
-          }
-          record.dirty.add(item.itemId);
-        },
-      });
-
-      item.state = 'completed';
-      item.bytesReceived = result.bytes;
-      item.speed = undefined;
-      item.filename = result.path;
-      record.summary.completed += 1;
-      bumpSessionStats(result.bytes);
-    } catch (err) {
-      const cancelled = controller.signal.aborted;
-      const message = err instanceof Error ? err.message : String(err);
-      const retryable =
-        !cancelled && typeof err === 'object' && err !== null && 'retryable' in err
-          ? Boolean((err as { retryable?: boolean }).retryable)
-          : false;
-
-      item.speed = undefined;
-      if (cancelled) {
-        item.state = 'cancelled';
-      } else if (retryable) {
-        const attempts = (record.attempts.get(item.itemId) ?? 0) + 1;
-        if (attempts <= MAX_AUTO_RETRY) {
-          record.attempts.set(item.itemId, attempts);
-          item.state = 'retrying';
-          item.error = `${message} · 正在第 ${attempts} 次重试`;
-          item.bytesReceived = 0;
-          record.dirty.add(item.itemId);
-          retryScheduled = true;
-          await broadcast(record);
-          scheduleSelfRetry(record, item.itemId, 1000 * 2 ** (attempts - 1));
-          return;
-        }
-        item.state = 'failed';
-        item.error = message;
-        record.summary.failed += 1;
-      } else {
-        item.state = 'failed';
-        item.error = message;
-        record.summary.failed += 1;
-      }
-    } finally {
-      selfControllers.delete(key);
-      record.dirty.add(item.itemId);
-      await broadcast(record);
-      if (!retryScheduled) {
-        record.running.delete(`s:${item.itemId}`);
-        await pump(record);
-      }
-      await checkFinished(record);
-    }
-  })();
-}
-
-/**
- * 退避结束后把条目放回队列。
- *
- * 退避期间条目一直挂在 running 上（占着并发名额），到这里才真正放出去 ——
- * 这样「1 秒后重试」才是真的等了一秒，而不是被紧接着的 pump 立刻抢走。
- */
-function scheduleSelfRetry(record: TaskRecord, itemId: string, delayMs: number): void {
-  const timer = setTimeout(() => {
-    record.running.delete(`s:${itemId}`);
-    record.queue.push(itemId);
-    record.dirty.add(itemId);
-    void pump(record);
-  }, delayMs);
-  // 同上：Node 下不让定时器吊住进程
-  (timer as unknown as { unref?: () => void })?.unref?.();
-}
-
-/* ------------------------------------------------------------------ */
-/* 等用户选目录                                                        */
-/* ------------------------------------------------------------------ */
-
-/** 用户选好目录了：把挂起的任务放出去继续下载 */
-export async function onDirectoryReady(): Promise<void> {
-  for (const record of tasks.values()) {
-    if (!record.waiting) continue;
-    record.waiting = false;
-    for (const item of record.items) {
-      if (item.state !== 'waiting') continue;
-      item.state = 'queued';
-      record.queue.push(item.itemId);
-      record.dirty.add(item.itemId);
-    }
-    await persist();
-    await broadcast(record, true);
-    await pump(record);
-  }
-}
-
-/**
- * 用户关掉了选目录窗口：挂起的任务取消掉。
- *
- * 只取消触发这个窗口的那个任务 —— 别的标签页可能也在等着选目录，
- * 不能因为这个窗口被关掉就把人家的下载也取消掉。
- */
-export async function onDirectoryCancelled(taskId?: string): Promise<void> {
-  for (const record of tasks.values()) {
-    if (!record.waiting) continue;
-    if (taskId && record.taskId !== taskId) continue;
-    record.waiting = false;
-    record.queue = [];
-    for (const item of record.items) {
-      if (item.state !== 'waiting') continue;
-      item.state = 'cancelled';
-      record.dirty.add(item.itemId);
-    }
-    await persist();
-    await broadcast(record, true);
-    await checkFinished(record);
-  }
-}
-
-/** 还有别的任务在等目录吗（返回其中一个的任务 id） */
-export function getWaitingTaskId(): string | undefined {
-  for (const record of tasks.values()) {
-    if (record.waiting) return record.taskId;
-  }
-  return undefined;
-}
-
-/** 用户选择「用浏览器的下载方式」：切换引擎，把挂起的任务交给浏览器 */
-export async function onUseBrowserDownload(): Promise<void> {
-  await saveSettings({ downloadMode: 'browser' });
-  for (const record of tasks.values()) {
-    if (!record.waiting) continue;
-    record.waiting = false;
-    record.engine = 'browser';
-    for (const item of record.items) {
-      if (item.state !== 'waiting') continue;
-      item.state = 'queued';
-      record.queue.push(item.itemId);
-      record.dirty.add(item.itemId);
-    }
-    await persist();
-    await broadcast(record, true);
-    await pump(record);
-  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -718,8 +781,8 @@ async function fetchRunning(
 async function poll(): Promise<void> {
   const active: Array<{ record: TaskRecord; downloadId: number; itemId: string }> = [];
   for (const record of tasks.values()) {
-    // 只看浏览器引擎的在途条目；自研引擎自己知道进度，不需要查
-    if (record.engine !== 'browser') continue;
+    // 只看浏览器下载的在途条目（key 带 d: 前缀）。
+    // 打包模式的最后一步也是一次浏览器下载，同样要跟。
     for (const [key, itemId] of record.running.entries()) {
       if (!key.startsWith('d:')) continue;
       active.push({ record, downloadId: Number(key.slice(2)), itemId });
@@ -734,6 +797,39 @@ async function poll(): Promise<void> {
   for (const entry of active) {
     const info = infos.get(entry.downloadId);
     if (!info) continue;
+
+    // 打包模式：整批只有一次下载，它落盘了就是整批落盘了
+    if (entry.itemId === ZIP_SLOT) {
+      if (info.state === 'complete') {
+        entry.record.running.delete(`d:${info.id}`);
+        const stillRunning = Array.from(entry.record.running.keys()).some((k) =>
+          k.startsWith('d:'),
+        );
+        if (!stillRunning && entry.record.engine === 'zip') {
+          const files = entry.record.packFiles;
+          await finishPackTask(
+            entry.record,
+            files?.dirName ?? '',
+            files?.packNames ?? [],
+          );
+        }
+      } else if (info.state === 'interrupted') {
+        entry.record.running.delete(`d:${info.id}`);
+        const error = info.error ?? '保存压缩包时中断了';
+        for (const item of entry.record.items) {
+          if (item.state !== 'downloading') continue;
+          item.state = 'failed';
+          item.error = error;
+          item.speed = undefined;
+          entry.record.summary.failed += 1;
+          entry.record.dirty.add(item.itemId);
+        }
+        await broadcast(entry.record);
+        await checkFinished(entry.record);
+      }
+      continue;
+    }
+
     const item = entry.record.items.find((i) => i.itemId === entry.itemId);
     if (!item) continue;
 
@@ -931,11 +1027,12 @@ export async function cancelTask(taskId: string): Promise<void> {
   const record = tasks.get(taskId);
   if (!record) return;
 
-  if (record.engine === 'self') {
-    // 自研引擎：中断 fetch，写入流随之作废（目标文件保持原样）
-    for (const [key, itemId] of record.running.entries()) {
-      if (!key.startsWith('s:')) continue;
-      selfControllers.get(selfKey(taskId, itemId))?.abort();
+  if (record.engine === 'zip') {
+    // 打包模式：让后台页面停下，同时把已经开始的那次下载也停掉
+    void chrome.runtime.sendMessage({ type: 'ZIP_CANCEL', taskId }).catch(() => undefined);
+    for (const key of record.running.keys()) {
+      if (!key.startsWith('d:')) continue;
+      await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
     }
   } else {
     for (const key of record.running.keys()) {
@@ -944,7 +1041,6 @@ export async function cancelTask(taskId: string): Promise<void> {
     }
   }
 
-  record.waiting = false;
   record.queue = [];
   record.items.forEach((item) => {
     if (item.state === 'queued' || item.state === 'waiting') {
@@ -975,20 +1071,25 @@ export async function retryItem(taskId: string, itemId: string): Promise<StartRe
   item.downloadId = undefined;
   item.totalBytes = source.size ?? -1;
   record.summary.failed = Math.max(0, record.summary.failed - 1);
-  record.queue.push(itemId);
   record.dirty.add(itemId);
+
+  if (record.engine === 'zip') {
+    // 打包模式没法「补一个文件进已经打好的包」，
+    // 所以把没下成功的几个重新打一个包（叫「xxx-补.zip」）。
+    const pending = record.items
+      .filter((i) => i.state === 'failed' || i.state === 'queued')
+      .map((i) => record.sources.get(i.itemId))
+      .filter((s): s is DownloadTaskItem => Boolean(s));
+    const settings = await getSettings();
+    await startPack(record, settings, pending, '-补');
+    return { waiting: false };
+  }
+
+  record.queue.push(itemId);
   await persist();
   await broadcast(record, true);
 
-  // 自研引擎如果目录没了，重试会直接挂起等用户重新选
-  const result = await pumpAndReport(record);
-  return result;
-}
-
-/** 跑一轮队列，并回报是否需要弹选目录窗口 */
-async function pumpAndReport(record: TaskRecord): Promise<StartResult> {
   await pump(record);
-  if (record.waiting && record.engine === 'self') return { waiting: true };
   return { waiting: false };
 }
 
@@ -1008,25 +1109,25 @@ export function getTaskSnapshot(taskId: string): DownloadTaskSnapshot | undefine
  * 两个引擎的答案不一样：
  *   - 浏览器引擎：问 Chrome 还在不在下（downloads.search）。
  *     浏览器那边的下载服务独立于 SW，SW 死了下载还在，所以查得到就继续跟。
- *   - 自研引擎：下载跑在 SW 里，SW 死了下载就没了 —— 一律标失败，让用户重试。
- *     （File System Access 的写入流是「临时文件 + 提交」，
- *     中途死掉的话磁盘上什么都没有，没法续传。）
+ *   - 打包模式：活儿在后台页面里跑，SW 死了它照跑 ——
+ *     后台页面最后会把结果报回来，SW 会被这条消息唤醒。
  */
 async function reconcile(record: TaskRecord): Promise<void> {
   if (record.running.size === 0) return;
 
-  if (record.engine === 'self') {
-    for (const [key, itemId] of Array.from(record.running.entries())) {
-      if (!key.startsWith('s:')) continue;
-      record.running.delete(key);
-      const item = record.items.find((x) => x.itemId === itemId);
-      if (item && item.state !== 'completed') {
+  if (record.engine === 'zip') {
+    // 后台页面可能已经被浏览器回收了（扩展重载、浏览器退出）——
+    // 那这个任务就没人接手了，直接标失败让用户重试。
+    if (!(await hasOffscreen())) {
+      for (const item of record.items) {
+        if (item.state !== 'downloading') continue;
         item.state = 'failed';
-        item.error = '下载被浏览器中断，请重试';
+        item.error = '打包被浏览器中断，请重试';
         item.speed = undefined;
         record.summary.failed += 1;
-        record.dirty.add(itemId);
+        record.dirty.add(item.itemId);
       }
+      record.running.delete('z:pack');
     }
     return;
   }
@@ -1063,18 +1164,8 @@ export async function initDownloader(): Promise<void> {
     if (record.running.size === 0 && record.queue.length === 0) continue;
     await reconcile(record);
 
-    if (record.engine === 'self') {
-      // 自研引擎的下载跑在 Service Worker 里，SW 被杀下载就断了。
-      // 队列里剩下的也一并标失败，让用户在面板里点重试 ——
-      // 重试时如果目录没了，会弹窗让用户重新选。
-      for (const itemId of record.queue) {
-        const item = record.items.find((x) => x.itemId === itemId);
-        if (!item) continue;
-        item.state = 'failed';
-        item.error = '下载被浏览器中断，请重试';
-        record.summary.failed += 1;
-        record.dirty.add(itemId);
-      }
+    if (record.engine === 'zip') {
+      // 打包在后台页面里跑，队列由后台页面管，这里不用管
       record.queue = [];
       await persist();
       await broadcast(record, true);

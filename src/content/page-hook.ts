@@ -203,16 +203,30 @@ const handlers: Record<string, Handler> = {
   /**
    * 取单篇笔记详情（主页批量下载时用）。
    *
-   * 走隐藏 iframe 加载真实笔记页，读它的 __INITIAL_STATE__。
-   * 笔记页是服务端渲染的，状态就内联在 HTML 里，实测单条 370ms 左右。
+   * 主路：抓笔记页的 HTML，直接把内联的 __INITIAL_STATE__ 解析出来。
+   * 笔记页是服务端渲染的，状态就写在 HTML 里 —— 拿 HTML 只需要网络开销，
+   * 不需要浏览器真的去渲染一个页面。
+   *
+   * 兜底：开隐藏 iframe 加载笔记页，读它渲染后的状态。
+   *
+   * 为什么主路换成抓 HTML：主页批量几百条笔记时，
+   * 每条都开一个 iframe 等于让浏览器加载并执行几百个完整页面 ——
+   * 实测几百条之后浏览器会明显变卡、页面请求都发不出去。
+   * 抓 HTML 是同样数量的轻量请求，没有渲染、没有脚本执行，快一个量级。
    *
    * 为什么不直接调站点 API：页面的 X-s 签名依赖一整套反爬头（mnsv2 / a1 /
-   * X-S-Common），site 改一次就失效，不值得依赖。iframe 读的是渲染结果，
-   * 反而更稳。
+   * X-S-Common），site 改一次就失效，不值得依赖。
    */
   'api.noteDetail': async (params: { noteId: string; xsecToken?: string }) => {
     const { noteId, xsecToken } = params ?? {};
     if (!noteId) return { ok: false, error: 'missing noteId' };
+
+    try {
+      const note = await loadNoteViaFetch(noteId, xsecToken);
+      if (note) return { ok: true, note, via: 'fetch' };
+    } catch {
+      /* ignore */
+    }
 
     try {
       const note = await loadNoteViaFrame(noteId, xsecToken);
@@ -224,6 +238,68 @@ const handlers: Record<string, Handler> = {
     return { ok: false, error: '无法获取笔记详情' };
   },
 };
+
+/**
+ * 从 HTML 里抠出 __INITIAL_STATE__。
+ *
+ * 站点把它内联在 <script> 里，形如 `window.__INITIAL_STATE__={...}`。
+ * 不能用正则去匹配对象（里面的字符串里可能有花括号），
+ * 所以按括号配平扫描，跳过字符串字面量。
+ */
+function parseInitialState(html: string): any | null {
+  const marker = 'window.__INITIAL_STATE__';
+  const at = html.indexOf(marker);
+  if (at < 0) return null;
+  const eq = html.indexOf('=', at + marker.length);
+  if (eq < 0) return null;
+  const start = html.indexOf('{', eq);
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < html.length; i += 1) {
+    const ch = html.charAt(i);
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(html.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/** 抓笔记页的 HTML，从里面解析出笔记详情 */
+async function loadNoteViaFetch(noteId: string, xsecToken?: string): Promise<RawNote | null> {
+  const url = `/explore/${encodeURIComponent(noteId)}${xsecToken ? `?xsec_token=${encodeURIComponent(xsecToken)}` : ''}`;
+  const response = await fetch(url, { credentials: 'include' });
+  if (!response.ok) return null;
+  const html = await response.text();
+  const state = parseInitialState(html);
+  if (!state) return null;
+  return extractNoteFromState(state, noteId);
+}
 
 /** 用隐藏 iframe 加载笔记页，读取它的 __INITIAL_STATE__ */
 async function loadNoteViaFrame(noteId: string, xsecToken?: string): Promise<RawNote | null> {

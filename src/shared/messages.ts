@@ -1,4 +1,11 @@
-import type { DownloadMode, DownloadProgress, DownloadTaskItem, Settings, TaskSummary } from './types';
+import type {
+  DownloadMode,
+  DownloadProgress,
+  DownloadTaskItem,
+  PackItem,
+  Settings,
+  TaskSummary,
+} from './types';
 
 /** content script → service worker */
 export type C2BMessage =
@@ -11,19 +18,69 @@ export type C2BMessage =
   | { type: 'OPEN_OPTIONS' }
   | { type: 'SHOW_DOWNLOADS'; downloadId?: number }
   | { type: 'GET_SESSION_STATS' }
-  /** 选目录窗口 / 设置页 → service worker */
-  | { type: 'DIRECTORY_READY'; name: string }
-  | { type: 'DIRECTORY_CANCELLED'; taskId?: string }
-  | { type: 'USE_BROWSER_DOWNLOAD' }
-  | { type: 'CLEAR_DIRECTORY' }
-  | { type: 'GET_DIRECTORY_STATE' }
   | { type: 'PING' };
 
-/** service worker → content script */
+/** service worker → service worker */
 export type B2CMessage =
   | { type: 'DOWNLOAD_PROGRESS'; progress: DownloadProgress[] }
   | { type: 'TASK_SUMMARY'; summary: TaskSummary }
   | { type: 'TASK_CLEARED'; taskId: string };
+
+/**
+ * service worker → 后台页面（offscreen）
+ *
+ * 打包这种「长时间跑」的活儿放在后台页面里，而不是 Service Worker：
+ * Service Worker 空闲 30 秒就会被浏览器杀掉，几百个文件的活儿根本跑不完；
+ * 后台页面没有这个限制。
+ */
+export type WorkerToOffscreen =
+  | {
+      type: 'ZIP_START';
+      taskId: string;
+      items: PackItem[];
+      concurrency: number;
+      /** 单个包的大小上限（字节） */
+      maxZipBytes: number;
+      /** 包的名字（不含扩展名） */
+      packName: string;
+      /** 相对于浏览器下载目录的文件夹（可空） */
+      rootFolder: string;
+    }
+  | { type: 'ZIP_CANCEL'; taskId: string }
+  /** 下载完了，把临时的包删掉（省磁盘） */
+  | { type: 'ZIP_CLEANUP'; taskId: string; dirName: string; packNames: string[] };
+
+/** 后台页面 → service worker */
+export type OffscreenToWorker =
+  | {
+      type: 'ZIP_ITEM_PROGRESS';
+      taskId: string;
+      itemId: string;
+      received: number;
+      total: number;
+    }
+  | { type: 'ZIP_ITEM_DONE'; taskId: string; itemId: string; bytes: number }
+  | { type: 'ZIP_ITEM_FAILED'; taskId: string; itemId: string; error: string }
+  /**
+   * 包打好了。
+   *
+   * blob: 地址只能由后台页面生成（Service Worker 里没有 createObjectURL），
+   * 而 chrome.downloads 只有 Service Worker 里有 ——
+   * 所以后台页面把地址交给 Service Worker，由它发起下载。
+   */
+  | {
+      type: 'ZIP_PACKS_READY';
+      taskId: string;
+      packs: {
+        dirName: string;
+        name: string;
+        objectUrl: string;
+        downloadPath: string;
+        bytes: number;
+        entries: number;
+      }[];
+    }
+  | { type: 'ZIP_FAILED'; taskId: string; error: string };
 
 export type AnyMessage = C2BMessage | B2CMessage;
 
@@ -37,18 +94,17 @@ export const MSG = {
   OPEN_OPTIONS: 'OPEN_OPTIONS',
   SHOW_DOWNLOADS: 'SHOW_DOWNLOADS',
   GET_SESSION_STATS: 'GET_SESSION_STATS',
-  DIRECTORY_READY: 'DIRECTORY_READY',
-  DIRECTORY_CANCELLED: 'DIRECTORY_CANCELLED',
-  USE_BROWSER_DOWNLOAD: 'USE_BROWSER_DOWNLOAD',
-  CLEAR_DIRECTORY: 'CLEAR_DIRECTORY',
-  GET_DIRECTORY_STATE: 'GET_DIRECTORY_STATE',
   PING: 'PING',
   DOWNLOAD_PROGRESS: 'DOWNLOAD_PROGRESS',
   TASK_SUMMARY: 'TASK_SUMMARY',
   TASK_CLEARED: 'TASK_CLEARED',
 } as const;
 
-/** 目录状态的对外描述（选目录窗口、设置页、面板都用它） */
+/**
+ * 目录状态的对外描述（设置页、面板都用它）。
+ *
+ * @deprecated 打包模式不再需要用户自己选目录 —— 包最后还是交给 Chrome 下载。
+ */
 export interface DirectoryState {
   /** 是否已经选过目录 */
   hasDirectory: boolean;

@@ -47,7 +47,8 @@
 
   "permissions": [
     "downloads",
-    "storage"
+    "storage",
+    "offscreen"
   ],
 
   "host_permissions": [
