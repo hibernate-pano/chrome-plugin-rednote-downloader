@@ -1,0 +1,194 @@
+:root {
+  --brand: #ff2442;
+  --brand-press: #e01f3d;
+  --bg-canvas: #ffffff;
+  --bg-raised: #f7f7f9;
+  --bg-sunken: #f0f0f3;
+  --border: #e9e9ee;
+  --border-strong: #d8d8e0;
+  --text-1: #18181c;
+  --text-2: #5e5e69;
+  --text-3: #9494a0;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei",
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --brand: #ff4d62;
+    --brand-press: #ff5c6e;
+    --bg-canvas: #1b1b1f;
+    --bg-raised: #242429;
+    --bg-sunken: #2c2c33;
+    --border: #34343c;
+    --border-strong: #43434d;
+    --text-1: #f0f0f4;
+    --text-2: #a2a2ae;
+    --text-3: #6e6e7a;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 440px;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-1);
+  background: var(--bg-canvas);
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+  min-height: 340px;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* 头部 */
+.hd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.hd-logo {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: linear-gradient(135deg, #ff5c72, #ff2442);
+  display: grid;
+  place-items: center;
+}
+.hd-logo svg {
+  width: 14px;
+  height: 14px;
+}
+.hd-name {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+/* 主体 */
+.main {
+  flex: 1;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+}
+.lead {
+  font-size: 13.5px;
+  color: var(--text-1);
+  margin-bottom: 12px;
+}
+
+.state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.state-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.state-dot.on {
+  background: var(--ok);
+}
+.state-dot.warn {
+  background: var(--warn);
+}
+.state-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-1);
+}
+.state-text.muted {
+  color: var(--text-2);
+}
+
+.note {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-2);
+  min-height: 18px;
+}
+.note.err {
+  color: var(--brand);
+}
+
+/* 按钮 */
+.btn {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--text-1);
+  font-size: 13px;
+  font-weight: 550;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    opacity 0.12s ease;
+}
+.btn:hover {
+  border-color: var(--brand);
+  color: var(--brand);
+}
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.btn-primary {
+  background: var(--brand-press);
+  border-color: var(--brand-press);
+  color: #fff;
+  margin-top: 14px;
+}
+.btn-primary:hover {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+.btn-ghost {
+  margin-top: 8px;
+  background: none;
+  border-color: transparent;
+  color: var(--text-2);
+  font-weight: 500;
+}
+.btn-ghost:hover {
+  border-color: transparent;
+  color: var(--text-1);
+  background: var(--bg-raised);
+}
+
+/* 底部 */
+.ft {
+  padding: 9px 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-3);
+}

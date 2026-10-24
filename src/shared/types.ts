@@ -112,7 +112,9 @@ export type DownloadState =
   | 'failed'
   | 'cancelled'
   /** 瞬时故障，正在自动重试 */
-  | 'retrying';
+  | 'retrying'
+  /** 等用户选好保存目录 */
+  | 'waiting';
 
 export interface DownloadProgress {
   taskId: string;
@@ -146,9 +148,22 @@ export interface DownloadTaskSnapshot {
   summary: TaskSummary;
 }
 
+/**
+ * 下载方式 —— 决定「谁来把文件写到磁盘上」。
+ *
+ * - self：扩展自己取字节、自己写文件（File System Access API）。
+ *   浏览器里不会留下任何下载记录，也没有浏览器的下载栏；
+ *   代价是用户要先选一次保存目录。
+ * - browser：走 Chrome 的下载管理器。零配置，但每个文件会在浏览器里
+ *   留下一条下载记录，批量时界面也会被下载栏占掉。
+ */
+export type DownloadMode = 'self' | 'browser';
+
 export interface Settings {
   /** 并发下载数 */
   concurrency: number;
+  /** 下载方式：自己写盘 / 交给浏览器下载 */
+  downloadMode: DownloadMode;
   /** 保存结构：每篇笔记一个独立文件夹 / 按作者分文件夹 / 全部平铺在主文件夹 */
   saveStructure: SaveStructure;
   /** 独立文件夹模式下的文件命名模板 */
@@ -177,6 +192,7 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   concurrency: 3,
+  downloadMode: 'self',
   saveStructure: 'perNote',
   fileNameTemplate: '{index}',
   perAuthorFileNameTemplate: '{title}_{index}',

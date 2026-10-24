@@ -14,6 +14,7 @@ const entryPoints = {
   background: path.join(root, 'src/background/index.ts'),
   popup: path.join(root, 'src/popup/index.ts'),
   options: path.join(root, 'src/options/index.ts'),
+  picker: path.join(root, 'src/picker/index.ts'),
 };
 
 const common = {

@@ -62,6 +62,9 @@ const stub = {
 };
 
 function installChrome(): FakeChrome {
+  // 这些用例测的是「交给浏览器下载」那条路径，
+  // 所以把下载方式显式设成 browser（默认是扩展自己写盘）。
+  stub.settings['rednote.settings'] = { downloadMode: 'browser' };
   const fake: FakeChrome = {
     downloads: {
       download: async () => {

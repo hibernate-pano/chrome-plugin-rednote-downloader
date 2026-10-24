@@ -2,7 +2,7 @@ import { PageBridge } from './bridge';
 import { Detector, classifyPage, type PageKind } from './detect/detector';
 import { buildRelativePath, fileNameForItem } from './detect/media';
 import type { RawNoteRef } from './detect/raw';
-import { MSG } from '../shared/messages';
+import { MSG, type DirectoryState } from '../shared/messages';
 import type {
   DownloadProgress,
   DownloadTaskItem,
@@ -63,6 +63,8 @@ class App {
   private mediaFilter: MediaFilter = 'all';
   /** 保存结构：每篇笔记一个独立文件夹，还是全部放进主文件夹 */
   private saveStructure: SaveStructure = 'perNote';
+  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
+  private saveLocation?: string;
 
   constructor() {
     this.detector = new Detector({
@@ -84,7 +86,7 @@ class App {
         onRescan: () => void this.rescan(),
         onRetry: (itemId) => void this.retry(itemId),
         onCancelTask: () => void this.cancelTask(),
-        onOpenDownloads: () => void chrome.runtime.sendMessage({ type: 'SHOW_DOWNLOADS' }),
+        onOpenDownloads: () => void this.openDownloads(),
         onOpenOptions: () => void chrome.runtime.sendMessage({ type: MSG.OPEN_OPTIONS }),
         onLogin: () => this.openLogin(),
         onResolveSelection: (ids) => void this.resolveAndDownload(ids),
@@ -153,6 +155,9 @@ class App {
         }
       }
     });
+
+    // 扩展自己写盘时，面板要显示文件存在哪
+    void this.loadDirectoryState();
 
     // 首次使用引导
     void this.maybeShowCoachMark();
@@ -276,6 +281,7 @@ class App {
       progress: this.progressMap,
       mediaFilter: this.mediaFilter,
       saveStructure: this.saveStructure,
+      saveLocation: this.saveLocation,
     };
     this.panel.renderNote(vm);
   }
@@ -335,6 +341,7 @@ class App {
       selected: new Set(),
       progress: new Map(),
       resolving: false,
+      saveLocation: this.saveLocation,
     };
     this.batchTaskId = undefined;
     this.batchStarted = false;
@@ -507,21 +514,26 @@ class App {
 
     this.batchTaskId = shortId('t');
     this.panel.renderBatch(this.batch);
-    await chrome.runtime.sendMessage({
+    const started = await chrome.runtime.sendMessage({
       type: MSG.START_DOWNLOADS,
       taskId: this.batchTaskId,
       items: taskItems,
     });
 
-    this.toast.info(
-      `已开始下载 ${taskItems.length} 个文件`,
-      [
-        skippedByFilter > 0 ? `按「只下载${mediaFilterLabel(this.mediaFilter)}」跳过了 ${skippedByFilter} 个` : undefined,
-        info.failed > 0 ? `有 ${info.failed} 条笔记没能解析出资源` : undefined,
-      ]
-        .filter(Boolean)
-        .join(' · ') || undefined,
-    );
+    if (started?.waiting) {
+      // 自研下载需要用户先选保存目录，选目录的窗口已经弹出来了
+      this.toast.info('第一次用要先选保存目录', '选好之后就会开始下载，以后的文件都存到那里');
+    } else {
+      this.toast.info(
+        `已开始下载 ${taskItems.length} 个文件`,
+        [
+          skippedByFilter > 0 ? `按「只下载${mediaFilterLabel(this.mediaFilter)}」跳过了 ${skippedByFilter} 个` : undefined,
+          info.failed > 0 ? `有 ${info.failed} 条笔记没能解析出资源` : undefined,
+        ]
+          .filter(Boolean)
+          .join(' · ') || undefined,
+      );
+    }
   }
 
   private itemCache = new Map<string, MediaItem>();
@@ -579,7 +591,7 @@ class App {
     }
     const taskId = shortId('t');
     this.noteTaskId = taskId;
-    await chrome.runtime.sendMessage({
+    const started = await chrome.runtime.sendMessage({
       type: MSG.START_DOWNLOADS,
       taskId,
       items: picked.map<DownloadTaskItem>((item) => ({
@@ -594,10 +606,36 @@ class App {
       })),
     });
     const skipped = items.length - picked.length;
+    if (started?.waiting) {
+      this.toast.info('第一次用要先选保存目录', '选好之后就会开始下载，以后的文件都存到那里');
+      return;
+    }
     this.toast.info(
       `已开始下载 ${picked.length} 个文件`,
       skipped > 0 ? `按「只下载${mediaFilterLabel(this.mediaFilter)}」跳过了 ${skipped} 个` : undefined,
     );
+  }
+
+  /**
+   * 「打开下载」的落点。
+   *
+   * 走浏览器下载时是 Chrome 的下载列表；
+   * 扩展自己写盘时浏览器里根本没有下载记录 —— 那就告诉用户文件存在哪。
+   */
+  private async openDownloads(): Promise<void> {
+    if (this.saveLocation) {
+      this.toast.show({
+        title: `文件保存在「${this.saveLocation}」`,
+        body: '在设置里可以随时更换',
+        tone: 'info',
+        action: {
+          label: '去设置',
+          onClick: () => void chrome.runtime.sendMessage({ type: MSG.OPEN_OPTIONS }),
+        },
+      });
+      return;
+    }
+    await chrome.runtime.sendMessage({ type: 'SHOW_DOWNLOADS' });
   }
 
   private async retry(itemId: string): Promise<void> {
@@ -613,7 +651,11 @@ class App {
   }
 
   private onProgress(list: DownloadProgress[]): void {
+    // 条目从「等目录」变成别的状态 = 用户刚选好保存目录，刷新一下面板上的保存位置
+    let directoryChanged = false;
     for (const progress of list) {
+      const prev = this.progressMap.get(progress.itemId);
+      if (prev?.state === 'waiting' && progress.state !== 'waiting') directoryChanged = true;
       this.progressMap.set(progress.itemId, progress);
       if (progress.taskId === this.batchTaskId) {
         this.batch.progress.set(progress.itemId, progress);
@@ -624,13 +666,19 @@ class App {
     const completed = all.filter((p) => p.state === 'completed').length;
     const failed = all.filter((p) => p.state === 'failed').length;
     const running = all.filter(
-      (p) => p.state === 'downloading' || p.state === 'retrying' || p.state === 'queued',
+      (p) =>
+        p.state === 'downloading' ||
+        p.state === 'retrying' ||
+        p.state === 'queued' ||
+        p.state === 'waiting',
     ).length;
     const settled = all.filter(
       (p) => p.state === 'completed' || p.state === 'failed' || p.state === 'cancelled',
     ).length;
     const total = all.length;
     const pct = total > 0 ? Math.round((settled / total) * 100) : 0;
+
+    if (directoryChanged) void this.loadDirectoryState();
 
     this.panel.setFabBackgroundProgress(running > 0 || settled < total ? pct : null);
 
@@ -649,6 +697,31 @@ class App {
         });
       }
     }
+  }
+
+  /* --------------------------- 保存位置 --------------------------- */
+
+  /**
+   * 拉一次目录状态。
+   *
+   * 走浏览器下载时没有「保存位置」这回事，面板就还是原来的「下载列表」按钮。
+   */
+  private async loadDirectoryState(): Promise<void> {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: MSG.GET_DIRECTORY_STATE });
+      const state = res?.state as DirectoryState | undefined;
+      // 目录名可能为空（比如某些实现返回的根目录），空名就当没设
+      this.applySaveLocation(state?.mode === 'self' && state.name ? state.name : undefined);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private applySaveLocation(location?: string): void {
+    this.saveLocation = location;
+    this.panel.setSaveLocation(location);
+    this.batch.saveLocation = location;
+    if (this.pageKind === 'note') this.renderNote();
   }
 
   /* --------------------------- 其它 --------------------------- */

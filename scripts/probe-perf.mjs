@@ -312,6 +312,13 @@ async function main() {
 
   const page = await connect(pageTarget.webSocketDebuggerUrl);
   const sw = await connect(swTarget.webSocketDebuggerUrl);
+  await sw.send('Runtime.enable');
+
+  // 这个探针量的是「交给浏览器下载」那条路径的调用量，
+  // 所以显式把下载方式设成 browser（默认是扩展自己写盘）。
+  await sw.eval(
+    `chrome.storage.local.set({'rednote.settings': {downloadMode: 'browser'}}).then(() => 'ok')`,
+  );
   await page.send('Page.enable');
   await page.send('Runtime.enable');
   await sw.send('Runtime.enable');

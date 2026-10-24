@@ -1,4 +1,5 @@
 import type {
+  DownloadMode,
   DownloadProgress,
   DownloadState,
   DownloadTaskItem,
@@ -8,6 +9,8 @@ import type {
 } from '../shared/types';
 import { DEFAULT_SETTINGS } from '../shared/types';
 import type { HistoryEntry } from '../shared/messages';
+import { getWritableRoot } from '../shared/fs-store';
+import { downloadToFile } from './engine-self';
 
 const STATE_KEY = 'rednote.download.tasks';
 const STATS_KEY = 'rednote.session.stats';
@@ -50,9 +53,21 @@ const MAX_AUTO_RETRY = 2;
 interface TaskRecord {
   taskId: string;
   tabId?: number;
+  /** 这个任务用哪个引擎下载：自己写盘 / 交给浏览器 */
+  engine: DownloadMode;
+  /** 正在等用户选保存目录 */
+  waiting: boolean;
   items: DownloadProgress[];
   queue: string[];
-  running: Map<number, string>;
+  /**
+   * 在途条目：key → itemId。
+   *
+   * key 带引擎前缀（d=浏览器下载 id，s=自研引擎的 itemId），
+   * 这样两个引擎的在途条目能放在同一张表里互不干扰。
+   * 一律用字符串：存进 storage.session 再读回来时数字会变成字符串，
+   * 用数字当 key 会出现「删不掉」的幽灵条目。
+   */
+  running: Map<string, string>;
   summary: TaskSummary;
   /** itemId → 原始下载参数 */
   sources: Map<string, DownloadTaskItem>;
@@ -66,6 +81,13 @@ interface TaskRecord {
   lastBroadcastAt: number;
   /** 上次全量同步时间：页面刷新后靠它把进度补齐 */
   lastFullSyncAt: number;
+}
+
+/** 自研引擎的取消开关：taskId:itemId → AbortController */
+const selfControllers = new Map<string, AbortController>();
+
+function selfKey(taskId: string, itemId: string): string {
+  return `${taskId}:${itemId}`;
 }
 
 const tasks = new Map<string, TaskRecord>();
@@ -153,7 +175,18 @@ async function restore(): Promise<void> {
       for (const item of list) {
         const record: TaskRecord = {
           ...item,
-          running: new Map(item.running ?? []),
+          engine: (item.engine ?? 'browser') as DownloadMode,
+          waiting: Boolean(item.waiting),
+          // 旧版本存的是数字 key，读回来是字符串，而且没有引擎前缀。
+          // 这里统一补上 'd' 前缀，不然浏览器引擎认不出在途条目。
+          running: new Map(
+            (item.running ?? []).map(([key, value]: [unknown, string]) => [
+              typeof key === 'string' && (key.startsWith('d:') || key.startsWith('s:'))
+                ? key
+                : `d:${key}`,
+              value,
+            ]),
+          ),
           sources: new Map(item.sources ?? []),
           attempts: new Map(item.attempts ?? []),
           lastTick: new Map(item.lastTick ?? []),
@@ -301,14 +334,22 @@ async function broadcast(record: TaskRecord, force = false): Promise<void> {
 /* 队列                                                                */
 /* ------------------------------------------------------------------ */
 
+export interface StartResult {
+  /** true = 正在等用户选保存目录，调用方需要弹出选目录窗口 */
+  waiting: boolean;
+}
+
 export async function startDownloads(
   tabId: number | undefined,
   taskId: string,
   items: DownloadTaskItem[],
-): Promise<void> {
+): Promise<StartResult> {
+  const settings = await getSettings();
   const record: TaskRecord = {
     taskId,
     tabId,
+    engine: settings.downloadMode,
+    waiting: false,
     items: items.map((item) => ({
       taskId,
       itemId: item.itemId,
@@ -338,46 +379,106 @@ export async function startDownloads(
   // 先把完整清单给页面，再启动下载 ——
   // 页面得先知道一共要下多少个，进度才有分母
   await broadcast(record, true);
+
+  // 自研引擎需要用户先选好保存目录；没选就先把任务挂起，
+  // 由上层弹出选目录窗口，用户选完再继续
+  if (record.engine === 'self' && !(await getWritableRoot())) {
+    record.waiting = true;
+    // 队列要清空：目录选好后 onDirectoryReady 会把这些条目重新入队。
+    // 不清的话同一个条目会在队列里出现两次，文件会被下两遍。
+    record.queue = [];
+    for (const item of record.items) item.state = 'waiting';
+    record.dirty = new Set(record.items.map((i) => i.itemId));
+    await persist();
+    await broadcast(record, true);
+    return { waiting: true };
+  }
+
   await pump(record);
   // 在途下载的 id 记在 running 里，Service Worker 被杀之后要靠它对账，
   // 所以这里必须立刻落盘一次，不能等节流
   await persist();
+  return { waiting: false };
 }
 
+/**
+ * 启动队列。
+ *
+ * 两个引擎在这里分流：浏览器引擎用 chrome.downloads.download 起步，
+ * 自研引擎自己 fetch + 写文件。队列、并发、重试、统计的逻辑两边共用。
+ */
 async function pump(record: TaskRecord): Promise<void> {
   const settings = await getSettings();
   const limit = Math.max(1, Math.min(8, settings.concurrency));
 
-  while (record.running.size < limit && record.queue.length > 0) {
-    const itemId = record.queue.shift()!;
-    const item = record.items.find((i) => i.itemId === itemId);
-    if (!item) continue;
+  // 还在等保存目录，先不启动任何下载
+  if (record.waiting) {
+    ensureHeartbeat();
+    await broadcast(record);
+    return;
+  }
 
-    const source = record.sources.get(itemId);
-    if (!source) {
-      item.state = 'failed';
-      item.error = '任务数据丢失';
-      record.summary.failed += 1;
-      record.dirty.add(itemId);
-      continue;
+  if (record.engine === 'self') {
+    const root = await getWritableRoot();
+    if (!root) {
+      // 目录没了（用户撤销授权 / 换了目录）—— 挂起，等上层重新弹窗
+      record.waiting = true;
+      for (const item of record.items) {
+        if (item.state === 'queued') item.state = 'waiting';
+      }
+      record.queue = [];
+      record.dirty = new Set(record.items.map((i) => i.itemId));
+      ensureHeartbeat();
+      await persist();
+      await broadcast(record, true);
+      return;
     }
+    while (record.running.size < limit && record.queue.length > 0) {
+      const itemId = record.queue.shift()!;
+      const item = record.items.find((i) => i.itemId === itemId);
+      if (!item) continue;
+      const source = record.sources.get(itemId);
+      if (!source) {
+        item.state = 'failed';
+        item.error = '任务数据丢失';
+        record.summary.failed += 1;
+        record.dirty.add(itemId);
+        continue;
+      }
+      startSelfItem(record, item, source, root);
+    }
+  } else {
+    while (record.running.size < limit && record.queue.length > 0) {
+      const itemId = record.queue.shift()!;
+      const item = record.items.find((i) => i.itemId === itemId);
+      if (!item) continue;
 
-    try {
-      const downloadId = await chrome.downloads.download({
-        url: source.url,
-        filename: source.filename,
-        conflictAction: 'uniquify',
-        saveAs: false,
-      });
-      item.downloadId = downloadId;
-      item.state = 'downloading';
-      record.running.set(downloadId, itemId);
-      record.dirty.add(itemId);
-    } catch (err) {
-      item.state = 'failed';
-      item.error = err instanceof Error ? err.message : String(err);
-      record.summary.failed += 1;
-      record.dirty.add(itemId);
+      const source = record.sources.get(itemId);
+      if (!source) {
+        item.state = 'failed';
+        item.error = '任务数据丢失';
+        record.summary.failed += 1;
+        record.dirty.add(itemId);
+        continue;
+      }
+
+      try {
+        const downloadId = await chrome.downloads.download({
+          url: source.url,
+          filename: source.filename,
+          conflictAction: 'uniquify',
+          saveAs: false,
+        });
+        item.downloadId = downloadId;
+        item.state = 'downloading';
+        record.running.set(`d:${downloadId}`, itemId);
+        record.dirty.add(itemId);
+      } catch (err) {
+        item.state = 'failed';
+        item.error = err instanceof Error ? err.message : String(err);
+        record.summary.failed += 1;
+        record.dirty.add(itemId);
+      }
     }
   }
 
@@ -385,6 +486,196 @@ async function pump(record: TaskRecord): Promise<void> {
   schedulePersist();
   await broadcast(record);
   await checkFinished(record);
+}
+
+/* ------------------------------------------------------------------ */
+/* 自研引擎                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 启动一个自研下载。
+ *
+ * 前半段是同步的：在途条目登记、状态置为「下载中」都在第一个 await 之前完成，
+ * 所以调用方紧接着检查并发数时看到的计数是准的。
+ */
+function startSelfItem(
+  record: TaskRecord,
+  item: DownloadProgress,
+  source: DownloadTaskItem,
+  root: FileSystemDirectoryHandle,
+): void {
+  const controller = new AbortController();
+  selfControllers.set(selfKey(record.taskId, item.itemId), controller);
+
+  item.state = 'downloading';
+  item.error = undefined;
+  record.running.set(`s:${item.itemId}`, item.itemId);
+  record.dirty.add(item.itemId);
+
+  const key = selfKey(record.taskId, item.itemId);
+
+  // 重试要等退避时间到了才重新入队。
+  // 退避期间这个条目仍然留在 running 里 —— 这样别的 pump 不会把它当成空闲名额抢走。
+  let retryScheduled = false;
+
+  void (async () => {
+    try {
+      const result = await downloadToFile({
+        root,
+        relPath: source.filename,
+        url: source.url,
+        signal: controller.signal,
+        onProgress: (received, total) => {
+          const now = Date.now();
+          item.bytesReceived = received;
+          if (total > 0) item.totalBytes = total;
+          const prev = record.lastTick.get(item.itemId) ?? { at: now, bytes: received };
+          const dt = (now - prev.at) / 1000;
+          if (dt >= 0.4) {
+            item.speed = Math.max(0, (received - prev.bytes) / dt);
+            record.lastTick.set(item.itemId, { at: now, bytes: received });
+          }
+          record.dirty.add(item.itemId);
+        },
+      });
+
+      item.state = 'completed';
+      item.bytesReceived = result.bytes;
+      item.speed = undefined;
+      item.filename = result.path;
+      record.summary.completed += 1;
+      bumpSessionStats(result.bytes);
+    } catch (err) {
+      const cancelled = controller.signal.aborted;
+      const message = err instanceof Error ? err.message : String(err);
+      const retryable =
+        !cancelled && typeof err === 'object' && err !== null && 'retryable' in err
+          ? Boolean((err as { retryable?: boolean }).retryable)
+          : false;
+
+      item.speed = undefined;
+      if (cancelled) {
+        item.state = 'cancelled';
+      } else if (retryable) {
+        const attempts = (record.attempts.get(item.itemId) ?? 0) + 1;
+        if (attempts <= MAX_AUTO_RETRY) {
+          record.attempts.set(item.itemId, attempts);
+          item.state = 'retrying';
+          item.error = `${message} · 正在第 ${attempts} 次重试`;
+          item.bytesReceived = 0;
+          record.dirty.add(item.itemId);
+          retryScheduled = true;
+          await broadcast(record);
+          scheduleSelfRetry(record, item.itemId, 1000 * 2 ** (attempts - 1));
+          return;
+        }
+        item.state = 'failed';
+        item.error = message;
+        record.summary.failed += 1;
+      } else {
+        item.state = 'failed';
+        item.error = message;
+        record.summary.failed += 1;
+      }
+    } finally {
+      selfControllers.delete(key);
+      record.dirty.add(item.itemId);
+      await broadcast(record);
+      if (!retryScheduled) {
+        record.running.delete(`s:${item.itemId}`);
+        await pump(record);
+      }
+      await checkFinished(record);
+    }
+  })();
+}
+
+/**
+ * 退避结束后把条目放回队列。
+ *
+ * 退避期间条目一直挂在 running 上（占着并发名额），到这里才真正放出去 ——
+ * 这样「1 秒后重试」才是真的等了一秒，而不是被紧接着的 pump 立刻抢走。
+ */
+function scheduleSelfRetry(record: TaskRecord, itemId: string, delayMs: number): void {
+  const timer = setTimeout(() => {
+    record.running.delete(`s:${itemId}`);
+    record.queue.push(itemId);
+    record.dirty.add(itemId);
+    void pump(record);
+  }, delayMs);
+  // 同上：Node 下不让定时器吊住进程
+  (timer as unknown as { unref?: () => void })?.unref?.();
+}
+
+/* ------------------------------------------------------------------ */
+/* 等用户选目录                                                        */
+/* ------------------------------------------------------------------ */
+
+/** 用户选好目录了：把挂起的任务放出去继续下载 */
+export async function onDirectoryReady(): Promise<void> {
+  for (const record of tasks.values()) {
+    if (!record.waiting) continue;
+    record.waiting = false;
+    for (const item of record.items) {
+      if (item.state !== 'waiting') continue;
+      item.state = 'queued';
+      record.queue.push(item.itemId);
+      record.dirty.add(item.itemId);
+    }
+    await persist();
+    await broadcast(record, true);
+    await pump(record);
+  }
+}
+
+/**
+ * 用户关掉了选目录窗口：挂起的任务取消掉。
+ *
+ * 只取消触发这个窗口的那个任务 —— 别的标签页可能也在等着选目录，
+ * 不能因为这个窗口被关掉就把人家的下载也取消掉。
+ */
+export async function onDirectoryCancelled(taskId?: string): Promise<void> {
+  for (const record of tasks.values()) {
+    if (!record.waiting) continue;
+    if (taskId && record.taskId !== taskId) continue;
+    record.waiting = false;
+    record.queue = [];
+    for (const item of record.items) {
+      if (item.state !== 'waiting') continue;
+      item.state = 'cancelled';
+      record.dirty.add(item.itemId);
+    }
+    await persist();
+    await broadcast(record, true);
+    await checkFinished(record);
+  }
+}
+
+/** 还有别的任务在等目录吗（返回其中一个的任务 id） */
+export function getWaitingTaskId(): string | undefined {
+  for (const record of tasks.values()) {
+    if (record.waiting) return record.taskId;
+  }
+  return undefined;
+}
+
+/** 用户选择「用浏览器的下载方式」：切换引擎，把挂起的任务交给浏览器 */
+export async function onUseBrowserDownload(): Promise<void> {
+  await saveSettings({ downloadMode: 'browser' });
+  for (const record of tasks.values()) {
+    if (!record.waiting) continue;
+    record.waiting = false;
+    record.engine = 'browser';
+    for (const item of record.items) {
+      if (item.state !== 'waiting') continue;
+      item.state = 'queued';
+      record.queue.push(item.itemId);
+      record.dirty.add(item.itemId);
+    }
+    await persist();
+    await broadcast(record, true);
+    await pump(record);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -427,8 +718,11 @@ async function fetchRunning(
 async function poll(): Promise<void> {
   const active: Array<{ record: TaskRecord; downloadId: number; itemId: string }> = [];
   for (const record of tasks.values()) {
-    for (const [downloadId, itemId] of record.running.entries()) {
-      active.push({ record, downloadId, itemId });
+    // 只看浏览器引擎的在途条目；自研引擎自己知道进度，不需要查
+    if (record.engine !== 'browser') continue;
+    for (const [key, itemId] of record.running.entries()) {
+      if (!key.startsWith('d:')) continue;
+      active.push({ record, downloadId: Number(key.slice(2)), itemId });
     }
   }
   if (active.length === 0) return;
@@ -471,7 +765,7 @@ async function poll(): Promise<void> {
       // 浏览器说完成了但文件是 0 字节 —— 这种情况必须当失败，
       // 否则用户以为下好了，硬盘上却什么都没有
       if (info.fileSize === 0) {
-        entry.record.running.delete(info.id);
+        entry.record.running.delete(`d:${info.id}`);
         item.state = 'failed';
         item.error = '下载完成但文件为空，已标记为失败';
         item.speed = undefined;
@@ -486,7 +780,7 @@ async function poll(): Promise<void> {
       item.bytesReceived = info.bytesReceived ?? received;
       item.totalBytes = info.totalBytes && info.totalBytes > 0 ? info.totalBytes : item.totalBytes;
       item.speed = undefined;
-      entry.record.running.delete(info.id);
+      entry.record.running.delete(`d:${info.id}`);
       entry.record.summary.completed += 1;
       entry.record.dirty.add(entry.itemId);
       bumpSessionStats(info.bytesReceived ?? 0);
@@ -494,7 +788,7 @@ async function poll(): Promise<void> {
       await pump(entry.record);
       await checkFinished(entry.record);
     } else if (info.state === 'interrupted') {
-      entry.record.running.delete(info.id);
+      entry.record.running.delete(`d:${info.id}`);
       item.speed = undefined;
       const error = info.error ?? '下载中断';
       if (error === 'USER_CANCELED') {
@@ -558,6 +852,9 @@ async function tick(): Promise<void> {
   lastTickAt = Date.now();
   try {
     await poll();
+    // 自研引擎的进度是「事件驱动」的（每收到一块数据就更新条目），
+    // 这里统一把变过的条目推给页面 —— 广播本身有节流，不会刷屏
+    for (const record of tasks.values()) await broadcast(record);
   } catch {
     /* ignore */
   } finally {
@@ -633,12 +930,24 @@ async function checkFinished(record: TaskRecord): Promise<void> {
 export async function cancelTask(taskId: string): Promise<void> {
   const record = tasks.get(taskId);
   if (!record) return;
-  for (const downloadId of record.running.keys()) {
-    await chrome.downloads.cancel(downloadId).catch(() => undefined);
+
+  if (record.engine === 'self') {
+    // 自研引擎：中断 fetch，写入流随之作废（目标文件保持原样）
+    for (const [key, itemId] of record.running.entries()) {
+      if (!key.startsWith('s:')) continue;
+      selfControllers.get(selfKey(taskId, itemId))?.abort();
+    }
+  } else {
+    for (const key of record.running.keys()) {
+      if (!key.startsWith('d:')) continue;
+      await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
+    }
   }
+
+  record.waiting = false;
   record.queue = [];
   record.items.forEach((item) => {
-    if (item.state === 'queued') {
+    if (item.state === 'queued' || item.state === 'waiting') {
       item.state = 'cancelled';
       record.dirty.add(item.itemId);
     }
@@ -649,14 +958,16 @@ export async function cancelTask(taskId: string): Promise<void> {
 }
 
 /** 重试单个失败的下载项 */
-export async function retryItem(taskId: string, itemId: string): Promise<void> {
+export async function retryItem(taskId: string, itemId: string): Promise<StartResult> {
   const record = tasks.get(taskId);
-  if (!record) return;
+  if (!record) return { waiting: false };
   const item = record.items.find((i) => i.itemId === itemId);
-  if (!item || item.state === 'downloading' || item.state === 'completed') return;
+  if (!item || item.state === 'downloading' || item.state === 'completed') {
+    return { waiting: false };
+  }
 
   const source = record.sources.get(itemId);
-  if (!source) return;
+  if (!source) return { waiting: false };
 
   item.state = 'queued';
   item.bytesReceived = 0;
@@ -668,7 +979,17 @@ export async function retryItem(taskId: string, itemId: string): Promise<void> {
   record.dirty.add(itemId);
   await persist();
   await broadcast(record, true);
+
+  // 自研引擎如果目录没了，重试会直接挂起等用户重新选
+  const result = await pumpAndReport(record);
+  return result;
+}
+
+/** 跑一轮队列，并回报是否需要弹选目录窗口 */
+async function pumpAndReport(record: TaskRecord): Promise<StartResult> {
   await pump(record);
+  if (record.waiting && record.engine === 'self') return { waiting: true };
+  return { waiting: false };
 }
 
 export function getTaskSnapshot(taskId: string): DownloadTaskSnapshot | undefined {
@@ -681,26 +1002,52 @@ export function getTaskSnapshot(taskId: string): DownloadTaskSnapshot | undefine
  * Service Worker 被 Chrome 杀掉再拉起后，对账在途下载。
  *
  * MV3 的 SW 空闲 30 秒就会被终止，轮询定时器随之消失；
- * 状态本身存在 storage.session 里所以不会丢，但「浏览器那边还认不认这个下载」
- * 必须重新问一次 —— 查不到的（比如用户清了下载历史）要标失败，
- * 否则那一项会永远卡在「下载中」，进度条一直转。
+ * 状态本身存在 storage.session 里所以不会丢，但「这个下载还在不在」必须重新确认 ——
+ * 不确认的话，那一项会永远卡在「下载中」，进度条一直转。
+ *
+ * 两个引擎的答案不一样：
+ *   - 浏览器引擎：问 Chrome 还在不在下（downloads.search）。
+ *     浏览器那边的下载服务独立于 SW，SW 死了下载还在，所以查得到就继续跟。
+ *   - 自研引擎：下载跑在 SW 里，SW 死了下载就没了 —— 一律标失败，让用户重试。
+ *     （File System Access 的写入流是「临时文件 + 提交」，
+ *     中途死掉的话磁盘上什么都没有，没法续传。）
  */
 async function reconcile(record: TaskRecord): Promise<void> {
   if (record.running.size === 0) return;
 
-  const entries = Array.from(record.running.entries());
+  if (record.engine === 'self') {
+    for (const [key, itemId] of Array.from(record.running.entries())) {
+      if (!key.startsWith('s:')) continue;
+      record.running.delete(key);
+      const item = record.items.find((x) => x.itemId === itemId);
+      if (item && item.state !== 'completed') {
+        item.state = 'failed';
+        item.error = '下载被浏览器中断，请重试';
+        item.speed = undefined;
+        record.summary.failed += 1;
+        record.dirty.add(itemId);
+      }
+    }
+    return;
+  }
+
+  const entries = Array.from(record.running.entries()).filter(([key]) => key.startsWith('d:'));
   const results = await Promise.all(
-    entries.map(([downloadId]) => chrome.downloads.search({ id: downloadId }).catch(() => [] as chrome.downloads.DownloadItem[])),
+    entries.map(([key]) =>
+      chrome.downloads
+        .search({ id: Number(key.slice(2)) })
+        .catch(() => [] as chrome.downloads.DownloadItem[]),
+    ),
   );
 
   for (let i = 0; i < entries.length; i += 1) {
-    const [downloadId, itemId] = entries[i]!;
+    const [key, itemId] = entries[i]!;
     const found = results[i] ?? [];
     const info = found[0];
     if (info) continue; // 浏览器还认得，交给 poll 继续跟
 
     const item = record.items.find((x) => x.itemId === itemId);
-    record.running.delete(downloadId);
+    record.running.delete(key);
     if (item && item.state !== 'completed') {
       item.state = 'failed';
       item.error = '下载任务已丢失（可能被浏览器清理），请重试';
@@ -715,6 +1062,25 @@ export async function initDownloader(): Promise<void> {
   for (const record of tasks.values()) {
     if (record.running.size === 0 && record.queue.length === 0) continue;
     await reconcile(record);
+
+    if (record.engine === 'self') {
+      // 自研引擎的下载跑在 Service Worker 里，SW 被杀下载就断了。
+      // 队列里剩下的也一并标失败，让用户在面板里点重试 ——
+      // 重试时如果目录没了，会弹窗让用户重新选。
+      for (const itemId of record.queue) {
+        const item = record.items.find((x) => x.itemId === itemId);
+        if (!item) continue;
+        item.state = 'failed';
+        item.error = '下载被浏览器中断，请重试';
+        record.summary.failed += 1;
+        record.dirty.add(itemId);
+      }
+      record.queue = [];
+      await persist();
+      await broadcast(record, true);
+      continue;
+    }
+
     void pump(record);
   }
   ensureHeartbeat();

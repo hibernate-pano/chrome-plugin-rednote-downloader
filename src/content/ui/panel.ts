@@ -54,6 +54,8 @@ export interface NoteViewModel {
   mediaFilter: MediaFilter;
   /** 保存结构：每篇笔记一个独立文件夹，还是全部放进主文件夹 */
   saveStructure: SaveStructure;
+  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
+  saveLocation?: string;
 }
 
 export interface BatchViewModel {
@@ -75,6 +77,8 @@ export interface BatchViewModel {
   resolving: boolean;
   /** 批量解析进度 */
   resolveInfo?: { done: number; total: number; failed: number };
+  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
+  saveLocation?: string;
 }
 
 export interface PanelCallbacks {
@@ -132,6 +136,10 @@ function rowStatusHtml(item: MediaItem, progress?: DownloadProgress): string {
     // 自动重试中：让用户看到「在处理」而不是一个卡住的进度条
     return '<span class="rn-retrying">网络异常，正在重试…</span>';
   }
+  if (state === 'waiting') {
+    // 等用户选保存目录：说清楚在等什么，不然看着像卡住了
+    return '<span class="rn-retrying">等你选好保存目录…</span>';
+  }
   if (state === 'completed') {
     return `已保存${progress?.totalBytes ? ` · ${formatBytes(progress.totalBytes)}` : ''}`;
   }
@@ -158,6 +166,7 @@ function cardStatusHtml(progress?: DownloadProgress): string {
   if (state === 'completed') return '<span class="rn-ok">已完成</span>';
   if (state === 'failed') return '<span class="rn-err">下载失败</span>';
   if (state === 'retrying') return `<span class="rn-resolving">${icon('spinner', 11)}重试中…</span>`;
+  if (state === 'waiting') return '<span class="rn-resolving">等你选目录</span>';
   if (state === 'queued') return '排队中';
   return '';
 }
@@ -208,6 +217,23 @@ function ringSvg(pct: number): string {
 /* ------------------------------------------------------------------ */
 
 export class Panel {
+  /** 扩展自己写盘时的保存位置；undefined = 走浏览器下载 */
+  private saveLocation?: string;
+
+  /**
+   * 告诉面板文件存在哪 —— 决定「打开」按钮说的是保存位置还是下载列表。
+   *
+   * 只重画页脚，不重建整块网格：重建会把几十张缩略图重新解码一次，
+   * 正好发生在用户刚开始下载的时候，闪一下很难看。
+   */
+  setSaveLocation(location?: string): void {
+    this.saveLocation = location;
+    const vm = this.lastBatchVm;
+    if (!vm) return;
+    vm.saveLocation = location;
+    this.renderBatchFooter(vm);
+  }
+
   private host!: HTMLElement;
   private shadow!: ShadowRoot;
   private fab!: HTMLButtonElement;
@@ -715,7 +741,12 @@ export class Panel {
       const btn = el('button', 'rn-btn');
       btn.type = 'button';
       btn.dataset.variant = 'text';
-      btn.setAttribute('aria-label', `打开浏览器下载列表：${item.filename}`);
+      btn.setAttribute(
+        'aria-label',
+        this.saveLocation
+          ? `已保存到 ${this.saveLocation}`
+          : `打开浏览器下载列表：${item.filename}`,
+      );
       btn.innerHTML = icon('folder', 15);
       btn.addEventListener('click', () => this.callbacks.onOpenDownloads());
       action.appendChild(btn);
@@ -1270,7 +1301,15 @@ export class Panel {
     for (const itemId of card.itemIds) {
       const p = vm.progress.get(itemId);
       if (!p) continue;
-      if (p.state === 'downloading' || p.state === 'failed' || p.state === 'retrying') return p;
+      if (
+        p.state === 'downloading' ||
+        p.state === 'failed' ||
+        p.state === 'retrying' ||
+        // 等用户选保存目录：也得让人看见，不然像卡住了
+        p.state === 'waiting'
+      ) {
+        return p;
+      }
       if (p.state === 'completed' && card.itemIds.every((id) => vm.progress.get(id)?.state === 'completed')) {
         return p;
       }
@@ -1357,7 +1396,13 @@ export class Panel {
 
       const openList = el('button', 'rn-btn');
       openList.type = 'button';
-      openList.innerHTML = `${icon('folder', 15)}下载列表`;
+      openList.innerHTML = vm.saveLocation
+        ? `${icon('folder', 15)}保存位置`
+        : `${icon('folder', 15)}下载列表`;
+      openList.setAttribute(
+        'aria-label',
+        vm.saveLocation ? `保存位置：${vm.saveLocation}` : '打开浏览器下载列表',
+      );
       openList.addEventListener('click', () => this.callbacks.onOpenDownloads());
       this.footer.appendChild(openList);
 
@@ -1395,6 +1440,10 @@ export class Panel {
     } else {
       title.textContent = '请选择要下载的内容';
       sub.textContent = `共 ${vm.cards.length} 条笔记`;
+    }
+    // 自己写盘时把保存位置挂在副标题上 —— 用户随时能确认文件会落在哪
+    if (vm.saveLocation) {
+      sub.textContent += ` · 保存到 ${vm.saveLocation}`;
     }
     info.append(title, sub);
 

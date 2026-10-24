@@ -35,6 +35,27 @@
       <section class="card">
         <h2 class="card-title">保存位置</h2>
 
+        <label class="row col">
+          <span class="row-label">下载方式</span>
+          <span class="row-hint">
+            「保存到文件夹」由扩展自己把文件写进你选的文件夹，浏览器里不会留下下载记录；
+            「浏览器下载」交给 Chrome 的下载管理器。
+          </span>
+          <div class="seg" id="seg-downloadMode">
+            <button type="button" data-value="self">保存到文件夹</button>
+            <button type="button" data-value="browser">浏览器下载</button>
+          </div>
+        </label>
+
+        <label class="row col" id="row-directory">
+          <span class="row-label">保存文件夹</span>
+          <span class="row-hint" id="directoryHint">还没有选择文件夹</span>
+          <div class="quick">
+            <button type="button" id="btn-pick-dir">选择文件夹</button>
+            <button type="button" id="btn-clear-dir">清除</button>
+          </div>
+        </label>
+
         <label class="row">
           <span class="row-label">根文件夹</span>
           <span class="row-hint">相对于浏览器的下载目录</span>

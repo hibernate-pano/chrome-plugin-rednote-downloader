@@ -5,7 +5,8 @@
  * 前置：npm run build
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import fs, { mkdirSync, rmSync, readdirSync, statSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -119,6 +120,37 @@ function walk(dir, out = [], depth = 0) {
   return out;
 }
 
+/**
+ * 把扩展的下载方式切到「浏览器下载」。
+ *
+ * 未打包扩展的 ID 由**真实路径**派生（macOS 上 /tmp 是 /private/tmp 的软链）。
+ */
+async function useBrowserEngine() {
+  const hex = createHash('sha256').update(fs.realpathSync(dist)).digest('hex').slice(0, 32);
+  let extId = '';
+  for (const c of hex) extId += String.fromCharCode(97 + parseInt(c, 16));
+
+  let swTarget = null;
+  for (let i = 0; i < 20; i += 1) {
+    const list = await httpJson(`http://127.0.0.1:${port}/json/list`);
+    swTarget = list.find(
+      (t) => t.type === 'service_worker' && t.url.startsWith(`chrome-extension://${extId}/`),
+    );
+    if (swTarget) break;
+    await sleep(300);
+  }
+  if (!swTarget) throw new Error('找不到 Service Worker target');
+
+  const sw = await connect(swTarget.webSocketDebuggerUrl);
+  await sw.send('Runtime.enable');
+  await sw.send('Runtime.evaluate', {
+    expression: `chrome.storage.local.set({'rednote.settings': {downloadMode: 'browser'}}).then(() => 'ok')`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  console.log('▶ 已切到「浏览器下载」模式');
+}
+
 /** 浏览器下载目录里符合扩展命名规则的文件 */
 function listDownloads() {
   const dir = path.join(process.env.HOME || '', 'Downloads');
@@ -179,6 +211,9 @@ async function main() {
   const cdp = await connect(page.webSocketDebuggerUrl);
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
+
+  // 这个脚本测的是「交给浏览器下载」那条路径（自研引擎由 e2e-self.mjs 覆盖）。
+  await useBrowserEngine();
 
   const logs = [];
   cdp.ws.addEventListener('message', (event) => {

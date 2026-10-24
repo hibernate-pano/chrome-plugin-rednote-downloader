@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>选择保存位置 · 小红书下载器</title>
+    <link rel="stylesheet" href="picker.css" />
+  </head>
+  <body>
+    <header class="hd">
+      <span class="hd-logo" id="logo"></span>
+      <span class="hd-name">选择保存位置</span>
+    </header>
+
+    <main class="main">
+      <p class="lead" id="lead">选一个文件夹，之后下载的内容会直接存进去。</p>
+
+      <div class="state" id="state">
+        <span class="state-dot" id="state-dot"></span>
+        <span class="state-text" id="state-text">读取中…</span>
+      </div>
+
+      <p class="note" id="note"></p>
+
+      <button class="btn btn-primary" id="btn-pick">选择文件夹</button>
+      <button class="btn btn-ghost" id="btn-browser">改用浏览器下载</button>
+    </main>
+
+    <footer class="ft">
+      <span id="ft-tip">只需要选一次，之后一直有效。</span>
+    </footer>
+
+    <script src="picker.js"></script>
+  </body>
+</html>

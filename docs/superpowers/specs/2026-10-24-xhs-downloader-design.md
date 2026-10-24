@@ -167,7 +167,8 @@ iframe 读的是渲染结果，不依赖任何反爬内部实现，反而更稳�
 
 ### 4.3 下载层
 
-- 直链直接交给 `chrome.downloads.download()`，扩展不读字节，因此不需要 host_permissions
+- **两条引擎**：`self`（默认，扩展自己取字节、自己写文件）/ `browser`（交给 `chrome.downloads`），
+  由设置切换；两条引擎共用同一套队列、重试、统计、广播
 - 队列在 Service Worker 里，状态存 `chrome.storage.session`（SW 被杀后能恢复）
 - 进度**一次查询覆盖所有在跑的下载**，只在有活动任务时轮询
 - 失败原因回传到 UI 并支持单项重试
@@ -228,8 +229,79 @@ iframe 读的是渲染结果，不依赖任何反爬内部实现，反而更稳�
 
 **权限收敛**：`declarativeNetRequestWithHostAccess` 曾用于给 xhscdn 补 Referer，
 但实测 DNR 规则**对 SW 发起的下载请求无效**，那条规则是死代码，连带权限一起删。
-`https://*.xhscdn.com/*` 的 host 权限同样删掉（下载走 `chrome.downloads`，不需要）。
+`https://*.xhscdn.com/*` 的 host 权限同样删掉（不需要）。
 最终只申请 `downloads` + `storage` 两个权限 —— 权限越少，商店审核越顺、用户越敢装。
+
+> 自研下载引擎上线后，权限清单**没有变**：CDN 回 `access-control-allow-origin: *`，
+> 所以扩展读媒体字节不需要任何 host 权限；`downloads` 权限保留下来是因为
+> `browser` 那条备选路径还要用它。
+
+#### 4.3.2 自己下载：把落盘从 Chrome 手里接过来
+
+**决策**：默认的下载方式改为**扩展自己取字节、自己写文件**，
+`chrome.downloads` 降级为可切换的备选。
+
+起因是用户问「能不能不用 chrome 的下载逻辑和下载 UI」。
+先量了三件事，结论是「值得换」：
+
+| 实测项 | chrome.downloads | 自己下载 |
+|---|---|---|
+| 40 个 84KB 文件的耗时 | 2114ms | 1730ms |
+| 8 个 11MB 视频的耗时 | 3913ms | 2010ms（快约 2×） |
+| 每次发起的往返延迟 | p50 180ms | p50 166ms（都是网络往返，差别不在这里） |
+| 浏览器里的下载记录 | 40 条 | **0 条** |
+
+顺带排除了一个慢性疑虑：`downloads.search` 的成本**不随**下载历史增长
+（625 条历史时仍是 1–2ms），所以「每批产生 N 条记录」不会让查询越来越慢 ——
+它的问题是**界面上有 N 行**、Downloads 文件夹被 N 个文件污染。
+
+**可行性依据（都是实测）**：
+
+1. 小红书 CDN 回 `access-control-allow-origin: *`，
+   所以扩展在**不申请任何 host 权限**的情况下就能 `fetch` 到媒体字节
+   （Service Worker 里直接 fetch：200，11.3MB 全部拿到）。
+   CDN 还支持 `accept-ranges: bytes`。
+2. `showDirectoryPicker()` 在扩展自己的页面里可用。
+3. 目录句柄存进扩展的 IndexedDB 后，Service Worker 读出来能正常 `createWritable()` 写入。
+
+**必须踩过的一个坑：句柄的 origin 归属。**
+内容脚本（isolated world）里 `showDirectoryPicker()` 拿到的句柄绑定的是
+**小红书这个站点**的 origin —— 存不进扩展的 IndexedDB，也传不到 Service Worker
+（`chrome.runtime.sendMessage` 走 JSON 序列化，句柄会被压成 `{}`，方法全丢）。
+只有扩展自己的页面拿到的句柄才绑定扩展的 origin。
+所以「选目录」这一步必须发生在扩展页面（弹一个小窗口，或设置页），
+句柄经 IndexedDB 中转后再交给 Service Worker。
+
+**架构上的落点**：
+
+```
+用户点下载
+   ↓
+Service Worker：settings.downloadMode === 'self'？
+   ├─ 否 → 走 chrome.downloads（原路径，保留为备选）
+   └─ 是 → 有可用目录？
+            ├─ 否 → 任务挂起（状态 waiting）→ 弹选目录窗口
+            │        └─ 用户选好 → 句柄进 IndexedDB → DIRECTORY_READY → 放行
+            └─ 是 → fetch(url) → 流式写进目录
+                     ├─ 进度：自己数字节，精确到字节
+                     ├─ 4xx：直接失败；5xx / 网络错误：退避重试
+                     └─ 落盘后回读大小，0 字节判为失败
+```
+
+**引擎差异被收敛在两处**：任务记录里存 `engine` 与 `waiting`，
+在途条目的 key 带引擎前缀（`d:` 浏览器下载 id / `s:` 自研 itemId），
+两个引擎共用同一套队列、重试、统计、广播逻辑。
+
+**如实记录的限制**：
+
+- **中途失败只能整个重下**。`createWritable()` 是「临时文件 + 提交」，
+  数据只在 `close()` 时落盘，中途失败磁盘上什么都没有；
+  真正的续传要靠 `createSyncAccessHandle()`，但它仅限 OPFS 的文件，用不了。
+- **SW 被杀，正在下的文件会断**。浏览器下载时 SW 死了下载还在（浏览器那边独立跑），
+  自己下载时 SW 死了下载就没了 —— 重启后把在途条目标失败、让用户重试。
+  实际上 SW 在下载期间不会空闲终止（心跳定时器本身就在打 API 调用）。
+- **目录句柄需要用户手势**：`showDirectoryPicker()` / `requestPermission()`
+  都必须在用户点击的处理函数里第一件事就调用，前面任何一次 `await` 都会消耗掉用户激活状态。
 
 ### 4.4 命名规则
 

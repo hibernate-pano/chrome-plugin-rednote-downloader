@@ -11,6 +11,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -180,6 +181,17 @@ class CDP {
   on(fn) {
     this.listeners.push(fn);
   }
+  async eval(expression) {
+    const res = await this.send('Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (res.exceptionDetails) {
+      throw new Error(res.exceptionDetails.exception?.description || 'evaluate 出错');
+    }
+    return res.result.value;
+  }
 }
 
 async function connect(url) {
@@ -216,6 +228,36 @@ function walk(dir, out = []) {
     else out.push(full);
   }
   return out;
+}
+
+/**
+ * 把扩展的下载方式切到「浏览器下载」。
+ *
+ * 未打包扩展的 ID 由**真实路径**派生（macOS 上 /tmp 是 /private/tmp 的软链）。
+ */
+async function useBrowserEngine(targets, testDist) {
+  const hex = createHash('sha256').update(fs.realpathSync(testDist)).digest('hex').slice(0, 32);
+  let extId = '';
+  for (const c of hex) extId += String.fromCharCode(97 + parseInt(c, 16));
+
+  let swTarget = targets.find(
+    (t) => t.type === 'service_worker' && t.url.startsWith(`chrome-extension://${extId}/`),
+  );
+  for (let i = 0; i < 20 && !swTarget; i += 1) {
+    await sleep(300);
+    const list = await (await fetch(`http://127.0.0.1:${port + 500}/json/list`)).json();
+    swTarget = list.find(
+      (t) => t.type === 'service_worker' && t.url.startsWith(`chrome-extension://${extId}/`),
+    );
+  }
+  if (!swTarget) throw new Error('找不到 Service Worker target');
+
+  const sw = await connect(swTarget.webSocketDebuggerUrl);
+  await sw.send('Runtime.enable');
+  await sw.eval(
+    `chrome.storage.local.set({'rednote.settings': {downloadMode: 'browser'}}).then(() => 'ok')`,
+  );
+  console.log('▶ 已切到「浏览器下载」模式');
 }
 
 function downloadRoot() {
@@ -283,6 +325,10 @@ async function main() {
     const targets = await (await fetch(`http://127.0.0.1:${port + 500}/json/list`)).json();
     const page = targets.find((t) => t.type === 'page');
     if (!page) throw new Error('找不到页面 target');
+
+    // 这个脚本测的是「交给浏览器下载」那条路径（自研引擎由 e2e-self.mjs 覆盖）。
+    // 默认是自研引擎，所以这里显式把下载方式改成 browser。
+    await useBrowserEngine(targets, testDist);
 
     const cdp = await connect(page.webSocketDebuggerUrl);
     await cdp.send('Runtime.enable');
