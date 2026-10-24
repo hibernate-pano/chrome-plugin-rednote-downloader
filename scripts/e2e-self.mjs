@@ -444,14 +444,40 @@ async function main() {
     })()
   `);
 
-  // 等文件落盘
+  // 等这个任务真的跑完 —— 不能只等「文件数量够了」：
+  // 下载中的文件也会占名额（临时文件 + 提交机制），
+  // 早一步断言就会读到还没下完的中间状态。
   let files = [];
-  for (let i = 0; i < 60; i += 1) {
-    await sleep(700);
+  let finished = false;
+  for (let i = 0; i < 120; i += 1) {
+    await sleep(500);
+    const state = JSON.parse(
+      await sw.eval(`
+        (async () => {
+          const raw = await chrome.storage.session.get('rednote.download.tasks');
+          const list = raw['rednote.download.tasks'] || [];
+          const t = list.pop();
+          return JSON.stringify({
+            finished: Boolean(t?.summary?.finishedAt),
+            states: (t?.items || []).map(i => i.state),
+          });
+        })()
+      `),
+    );
     files = JSON.parse(await sw.eval(listOpfs));
-    if (files.length >= 3) break;
+    if (state.finished) {
+      finished = true;
+      break;
+    }
   }
+  check('三个文件都下载完了', finished, JSON.stringify(files));
   check('文件真的落盘了', files.length >= 3, JSON.stringify(files));
+  // 下载过程中写的是 .crdownload 临时文件，下完改名 —— 目录里不该有残留
+  check(
+    '目录里没有临时文件残留',
+    files.every((f) => !/\.cr(download|swap)$/i.test(f.path)),
+    files.map((f) => f.path).join(' | '),
+  );
 
   const paths = files.map((f) => f.path);
   check(

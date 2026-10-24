@@ -17,6 +17,21 @@ interface FileSystemDirectoryHandle {
   requestPermission(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>;
 }
 
+interface FileSystemMoveOptions {
+  /** 目标已存在时是否覆盖（默认 false） */
+  overwrite?: boolean;
+}
+
+interface FileSystemFileHandle {
+  /**
+   * 改文件名（同一个目录内）。
+   *
+   * Chrome 111+ 支持，TypeScript 的 DOM lib 里还没收录，这里补上。
+   * 目标已存在会抛 InvalidModificationError —— 所以我们靠它来避免覆盖用户的文件。
+   */
+  move?(newName: string, options?: FileSystemMoveOptions): Promise<void>;
+}
+
 interface DirectoryPickerOptions {
   /** 记住上次选的目录（同一个 id 共享这份记忆） */
   id?: string;

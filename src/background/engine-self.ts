@@ -151,9 +151,78 @@ function isRetryableStatus(status: number): boolean {
 }
 
 /**
+ * 这个根目录能不能用 move() 改名：每个目录记一次，试过就不再试。
+ *
+ * 值为 false = 浏览器不支持改名，那就退回「直接写最终名字」的老办法。
+ */
+const moveSupport = new WeakMap<object, boolean>();
+
+/** move() 不支持（或者被浏览器拒绝）时抛这个，用来触发兜底路径 */
+class MoveUnsupportedError extends Error {}
+
+/**
+ * 找一个没被占用的临时文件名，并且立刻占住。
+ *
+ * 临时名也是别人可能用的名字（万一有文件就叫「1.jpg.crdownload」呢），
+ * 所以磁盘上查一遍、在下载名单里也查一遍。
+ */
+async function freeTempName(
+  dir: FileSystemDirectoryHandle,
+  finalName: string,
+  claimBase: string,
+): Promise<string> {
+  for (let i = 0; i < 100; i += 1) {
+    const candidate = i === 0 ? `${finalName}.crdownload` : `${finalName}.${i}.crdownload`;
+    const key = `${claimBase}/${candidate}`;
+    // 从检查到占住，中间不能有 await
+    if (claimedNames.has(key)) continue;
+    claimedNames.add(key);
+    try {
+      await dir.getFileHandle(candidate);
+    } catch {
+      return candidate; // 磁盘上没有这个名字
+    }
+    claimedNames.delete(key);
+  }
+  const fallback = `${finalName}.${Date.now()}.crdownload`;
+  claimedNames.add(`${claimBase}/${fallback}`);
+  return fallback;
+}
+
+/** 把一个文件的内容流式复制到另一个文件 */
+async function copyOver(
+  src: FileSystemFileHandle,
+  dest: FileSystemFileHandle,
+): Promise<void> {
+  const file = await src.getFile();
+  const writable = await dest.createWritable();
+  try {
+    const reader = file.stream().getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      await writable.write(value);
+    }
+    await writable.close();
+  } catch (err) {
+    await writable.abort().catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
  * 下载一个文件到目录。
  *
  * 全程流式：一次只在内存里留一个数据块，几百 MB 的视频也不会把内存吃满。
+ *
+ * 落盘分两步：先写 `名字.crdownload`，下完再改名成最终名字。
+ * 这么绕一圈是因为浏览器的写文件机制是「临时文件 + 提交」——
+ * 它会在目标文件旁边留一个 `名字.crswap`（Chromium 的实现，我们控制不了），
+ * 而目标文件在提交之前一直是 0 字节。直接写最终名字的话，
+ * 用户在自己的文件夹里会看到一堆 0 字节的「1.mp4」，像是坏了。
+ * 先写临时名再改名，最终名字是「一下子出现」的，
+ * 下载中看到的是 `1.mp4.crdownload` —— 和 Chrome 自己下载时一模一样。
  */
 export async function downloadToFile(opts: SelfDownloadOptions): Promise<SelfDownloadResult> {
   const { root, relPath, url, signal, onProgress } = opts;
@@ -165,11 +234,76 @@ export async function downloadToFile(opts: SelfDownloadOptions): Promise<SelfDow
   const fileName = await pickFreeName(dir, name, claimBase);
   const claimKey = `${claimBase}/${fileName}`;
 
+  // 浏览器不支持改名的话就直接写最终名字（少一次改名，但下载中最终名字是空的）
+  if (moveSupport.get(root) === false) {
+    try {
+      const bytes = await writeFile({ dir, dirs, fileName, url, signal, onProgress });
+      return { bytes, path: [...dirs, fileName].join('/') };
+    } finally {
+      claimedNames.delete(claimKey);
+    }
+  }
+
+  const tempName = await freeTempName(dir, fileName, claimBase);
+  const tempKey = `${claimBase}/${tempName}`;
+
   try {
-    return await writeFile({ dir, dirs, fileName, url, signal, onProgress });
+    const bytes = await writeFile({ dir, dirs, fileName: tempName, url, signal, onProgress });
+
+    try {
+      const finalName = await moveToFinal(dir, tempName, fileName, claimBase);
+      return { bytes, path: [...dirs, finalName].join('/') };
+    } catch (err) {
+      if (!(err instanceof MoveUnsupportedError)) throw err;
+      // 这个浏览器不让改名：把已经下好的内容搬到最终名字上，
+      // 之后这个目录就都直接写最终名字了
+      moveSupport.set(root, false);
+      const src = await dir.getFileHandle(tempName);
+      const dest = await dir.getFileHandle(fileName, { create: true });
+      await copyOver(src, dest);
+      await dir.removeEntry(tempName).catch(() => undefined);
+      return { bytes, path: [...dirs, fileName].join('/') };
+    }
   } finally {
     claimedNames.delete(claimKey);
+    claimedNames.delete(tempKey);
   }
+}
+
+/**
+ * 把临时文件改名成最终名字。
+ *
+ * 名字被占了（别的程序抢先建了同名文件）就换一个再来，
+ * 一直换到成功为止 —— 绝不覆盖用户已有的文件。
+ */
+async function moveToFinal(
+  dir: FileSystemDirectoryHandle,
+  tempName: string,
+  desiredName: string,
+  claimBase: string,
+): Promise<string> {
+  const handle = await dir.getFileHandle(tempName);
+  if (typeof handle.move !== 'function') {
+    throw new MoveUnsupportedError('这个浏览器不支持改名');
+  }
+  const move = handle.move.bind(handle);
+  let target = desiredName;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await move(target);
+      return target;
+    } catch (err) {
+      const isTaken =
+        err instanceof DOMException &&
+        (err.name === 'InvalidModificationError' || err.name === 'NotFoundError');
+      if (!isTaken) throw new MoveUnsupportedError('这个浏览器不支持改名');
+      // 名字被占了：先放开原来占的那个，再挑一个没被占的
+      claimedNames.delete(`${claimBase}/${target}`);
+      target = await pickFreeName(dir, desiredName, claimBase);
+    }
+  }
+  throw new MoveUnsupportedError('改名一直失败');
 }
 
 /** 把这一轮自己刚建出来的那个文件从磁盘上抹掉 */
@@ -186,6 +320,8 @@ async function removeCreatedFile(dir: FileSystemDirectoryHandle, fileName: strin
  *
  * 分出来是因为「占住文件名」这件事必须覆盖整个下载过程，
  * 而写文件的失败处理要能自己清理现场。
+ *
+ * 返回写进去的字节数；最终的文件名由调用方决定（可能是改完名的）。
  */
 async function writeFile(args: {
   dir: FileSystemDirectoryHandle;
@@ -194,8 +330,8 @@ async function writeFile(args: {
   url: string;
   signal: AbortSignal;
   onProgress: (received: number, total: number) => void;
-}): Promise<SelfDownloadResult> {
-  const { dir, dirs, fileName, url, signal, onProgress } = args;
+}): Promise<number> {
+  const { dir, fileName, url, signal, onProgress } = args;
 
   let response: Response;
   try {
@@ -261,8 +397,5 @@ async function writeFile(args: {
 
   onProgress(written.size, total > 0 ? total : written.size);
 
-  return {
-    bytes: written.size,
-    path: [...dirs, fileName].join('/'),
-  };
+  return written.size;
 }

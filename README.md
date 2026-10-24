@@ -132,14 +132,20 @@ npm run build
 
 ## 开发
 
+用 pnpm（仓库里只保留 `pnpm-lock.yaml` 一份锁文件）：
+
 ```bash
-npm install
-npm run build      # 打包到 dist/
-npm run watch      # 监听改动自动打包
-npm run typecheck  # TypeScript 检查
-npm test           # 单元测试（72 个用例）
-npm run e2e        # 端到端测试（真实 Chrome：笔记页 25 项 + 批量 27 项 + 自研下载 12 项）
+pnpm install
+pnpm build      # 打包到 dist/
+pnpm watch      # 监听改动自动打包
+pnpm typecheck  # TypeScript 检查
+pnpm test       # 单元测试（73 个用例）
+pnpm e2e        # 端到端测试（真实 Chrome：笔记页 25 项 + 批量 27 项 + 自研下载 12 项）
 ```
+
+> 脚本里不写死包管理器（用的是 `node build.mjs` 而不是 `npm run build`），
+> 所以 `npm run build` / `yarn build` 也能跑，只是别再用 npm 装依赖 ——
+> 装出来的依赖树和 `pnpm-lock.yaml` 对不上。
 
 ### 代码结构
 
@@ -230,6 +236,14 @@ File System Access 的 `createWritable()` 走的是「临时文件 + 提交」�
 数据只在 `close()` 时才落到目标文件上 —— 中途失败，磁盘上什么都没有。
 真正的续传要靠 `createSyncAccessHandle()`，但它仅限 OPFS 的文件，用不了。
 （网络瞬断会自动退避重试，行为与之前一致。）
+
+**下载过程中文件夹里会看到什么。**
+浏览器的写文件机制是「临时文件 + 提交」：它会在目标文件旁边留一个
+`1.mp4.crswap`（Chromium 的实现，扩展控制不了），而目标文件在提交之前一直是 0 字节。
+所以扩展改成**先写 `1.mp4.crdownload`，下完再改名成 `1.mp4`** ——
+下载中看到的是和 Chrome 自己下载时一样的 `.crdownload`，
+最终名字是「一下子出现」的，不会留一堆 0 字节的 `1.mp4` 看着像坏了。
+下完之后目录里干干净净，只剩最终文件。
 
 **两个容易踩的坑，这里都堵上了。**
 同名文件不会被悄悄覆盖（自动改成 `01 (1).jpg`），

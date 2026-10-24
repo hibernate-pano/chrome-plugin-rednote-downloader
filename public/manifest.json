@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "小红书下载器",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "一键下载小红书笔记里的视频与图片，支持主页批量扫描与选择下载。",
   "minimum_chrome_version": "114",
 

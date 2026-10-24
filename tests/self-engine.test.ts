@@ -53,7 +53,10 @@ class FakeFileHandle {
   readonly kind = 'file';
   writable?: FakeWritable;
 
-  constructor(readonly file: FakeFile) {}
+  constructor(
+    readonly file: FakeFile,
+    private readonly dir?: FakeDirHandle,
+  ) {}
 
   async createWritable(): Promise<FakeWritable> {
     this.writable = new FakeWritable(this.file);
@@ -62,6 +65,17 @@ class FakeFileHandle {
 
   async getFile(): Promise<{ size: number }> {
     return { size: this.file.bytes.length };
+  }
+
+  /** 改名（真实实现只支持同一个目录内改名） */
+  async move(newName: string): Promise<void> {
+    if (!this.dir) throw new DOMException('这个句柄不支持改名', 'NotSupportedError');
+    if (this.dir.files.has(newName)) {
+      throw new DOMException('目标已存在', 'InvalidModificationError');
+    }
+    this.dir.files.delete(this.file.name);
+    this.file.name = newName;
+    this.dir.files.set(newName, this);
   }
 }
 
@@ -89,7 +103,7 @@ class FakeDirHandle {
     if (found) return found;
     if (!opts?.create) throw new DOMException('NotFoundError');
     const file: FakeFile = { name, bytes: new Uint8Array() };
-    const handle = new FakeFileHandle(file);
+    const handle = new FakeFileHandle(file, this);
     this.files.set(name, handle);
     return handle;
   }
@@ -188,6 +202,25 @@ test('engine-self：文件内容、目录层级和进度回调都对', async () 
   const noteDir = root.dirs.get('小红书下载')!.dirs.get('昵称')!.dirs.get('标题');
   assert.ok(noteDir, '多级目录被逐层创建');
   assert.ok(noteDir.files.has('01.jpg'));
+});
+
+test('engine-self：下完就改名，目录里不留临时文件', async () => {
+  const root = new FakeDirHandle('root');
+  stubFetch(async () => fakeResponse(bytesOf(50), 200, { 'content-length': '50' }));
+
+  const result = await downloadToFile({
+    root: root as unknown as FileSystemDirectoryHandle,
+    relPath: 'a/1.jpg',
+    url: 'https://cdn/1.jpg',
+    signal: new AbortController().signal,
+    onProgress: () => undefined,
+  });
+
+  assert.equal(result.path, 'a/1.jpg', '结果是最终的文件名');
+  const dir = root.dirs.get('a')!;
+  // 下载过程中写的是 1.jpg.crdownload，下完改名成 1.jpg —— 目录里只该有最终文件
+  assert.deepEqual([...dir.files.keys()], ['1.jpg'], '没有留下 .crdownload 临时文件');
+  assert.equal(dir.files.get('1.jpg')?.file.bytes.length, 50);
 });
 
 test('engine-self：同名文件不会被覆盖，而是加上 (1)', async () => {
