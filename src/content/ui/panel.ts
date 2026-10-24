@@ -119,14 +119,87 @@ function percent(progress: DownloadProgress): number | null {
   return null;
 }
 
+/** 单篇笔记里某个资源行的状态文案 */
+function rowStatusHtml(item: MediaItem, progress?: DownloadProgress): string {
+  const state = progress?.state ?? 'idle';
+  if (state === 'downloading') {
+    const pct = percent(progress!);
+    return pct !== null
+      ? `${pct}% · ${formatBytes(progress!.bytesReceived)} / ${formatBytes(progress!.totalBytes)}`
+      : `${formatBytes(progress!.bytesReceived)}`;
+  }
+  if (state === 'retrying') {
+    // 自动重试中：让用户看到「在处理」而不是一个卡住的进度条
+    return '<span class="rn-retrying">网络异常，正在重试…</span>';
+  }
+  if (state === 'completed') {
+    return `已保存${progress?.totalBytes ? ` · ${formatBytes(progress.totalBytes)}` : ''}`;
+  }
+  if (state === 'failed') {
+    return `<span class="rn-err">下载失败</span>${progress?.error ? ` · ${progress.error}` : ''}`;
+  }
+  if (item.isStream) {
+    return '<span class="rn-err">HLS 流</span> · 暂不支持直接保存';
+  }
+  const bits: string[] = [];
+  if (item.size) bits.push(formatBytes(item.size));
+  if (item.width && item.height) bits.push(`${item.width}×${item.height}`);
+  if (item.kind === 'video' && item.duration) bits.push(formatDuration(item.duration));
+  return bits.join(' · ') || '大小未知';
+}
+
+/** 主页卡片上的状态文案 */
+function cardStatusHtml(progress?: DownloadProgress): string {
+  const state = progress?.state ?? 'idle';
+  if (state === 'downloading') {
+    const pct = percent(progress!) ?? 0;
+    return `${pct}% · ${formatBytes(progress!.bytesReceived)}${progress!.speed ? ` · ${formatSpeed(progress!.speed)}` : ''}`;
+  }
+  if (state === 'completed') return '<span class="rn-ok">已完成</span>';
+  if (state === 'failed') return '<span class="rn-err">下载失败</span>';
+  if (state === 'retrying') return `<span class="rn-resolving">${icon('spinner', 11)}重试中…</span>`;
+  if (state === 'queued') return '排队中';
+  return '';
+}
+
+/** 笔记页里一行资源的可更新节点 */
+interface NoteRowRefs {
+  row: HTMLElement;
+  item: MediaItem;
+  meta: HTMLElement;
+  bar: HTMLElement;
+  fill: HTMLElement;
+  action: HTMLElement;
+  done: HTMLElement;
+  /** 上一次的状态，用来判断右侧操作区要不要重建 */
+  state: string;
+  /** 下载中的百分比标签 */
+  pct?: HTMLElement;
+}
+
+/** 主页里一张卡片的可更新节点 */
+interface BatchCardRefs {
+  node: HTMLElement;
+  card: BatchCard;
+  imgWrap: HTMLElement;
+  meta: HTMLElement;
+  state: string;
+}
+
+const RING_R = 11;
+const RING_C = 2 * Math.PI * RING_R;
+
+/** 进度环的缺口：百分比越满，缺口越小 */
+function ringOffset(pct: number): number {
+  return RING_C * (1 - pct / 100);
+}
+
 function ringSvg(pct: number): string {
-  const r = 11;
-  const c = 2 * Math.PI * r;
-  const offset = c * (1 - pct / 100);
+  const offset = ringOffset(pct);
   return `<svg class="rn-ring" width="28" height="28" viewBox="0 0 28 28">
-    <circle class="track" cx="14" cy="14" r="${r}" fill="none" stroke-width="2.5"/>
-    <circle class="bar" cx="14" cy="14" r="${r}" fill="none" stroke-width="2.5"
-      stroke-dasharray="${c.toFixed(2)}" stroke-dashoffset="${offset.toFixed(2)}"/>
+    <circle class="track" cx="14" cy="14" r="${RING_R}" fill="none" stroke-width="2.5"/>
+    <circle class="bar" cx="14" cy="14" r="${RING_R}" fill="none" stroke-width="2.5"
+      stroke-dasharray="${RING_C.toFixed(2)}" stroke-dashoffset="${offset.toFixed(2)}"/>
   </svg>`;
 }
 
@@ -156,6 +229,16 @@ export class Panel {
   /** itemId → 所属卡片 noteId（批量模式用） */
   private itemToCard = new Map<string, string>();
   private collapsed = new Set<string>();
+
+  /**
+   * 进度更新时要改的节点。
+   *
+   * 进度每秒变好几次，如果每次都整块重画，几十张卡片的缩略图会被反复
+   * 销毁重建 —— 图片要重新解码，主线程直接卡住。这里把节点留住，
+   * 只改变化的那几行 / 那几张卡。
+   */
+  private noteRows = new Map<string, NoteRowRefs>();
+  private cardNodes = new Map<string, BatchCardRefs>();
 
   constructor(callbacks: PanelCallbacks, settings: Settings) {
     this.callbacks = callbacks;
@@ -404,6 +487,7 @@ export class Panel {
     this.mode = 'note';
     this.toolbar.hidden = false;
     this.footer.hidden = false;
+    this.noteRows.clear();
 
     this.header.innerHTML = '';
     const text = el('div', 'rn-head-text');
@@ -525,7 +609,6 @@ export class Panel {
   private buildRow(item: MediaItem, progress?: DownloadProgress): HTMLElement {
     const row = el('div', 'rn-row');
     const state = progress?.state ?? 'idle';
-    if (progress) row.dataset.state = state;
     // 挂上类型，方便排障与自动化检查
     row.dataset.kind = item.kind;
 
@@ -542,11 +625,12 @@ export class Panel {
       play.innerHTML = icon('play', 14);
       thumb.appendChild(play);
     }
-    if (state === 'completed') {
-      const done = el('div', 'rn-thumb-done');
-      done.innerHTML = icon('check', 9);
-      thumb.appendChild(done);
-    }
+    // 完成角标常驻，用 hidden 切换 ——
+    // 进度更新时不必重建这一行，缩略图也不用重新解码
+    const done = el('div', 'rn-thumb-done');
+    done.innerHTML = icon('check', 9);
+    done.hidden = state !== 'completed';
+    thumb.appendChild(done);
     row.appendChild(thumb);
 
     const main = el('div', 'rn-row-main');
@@ -557,50 +641,76 @@ export class Panel {
     main.appendChild(name);
 
     const meta = el('div', 'rn-row-meta');
-    if (state === 'downloading') {
-      const pct = percent(progress!);
-      meta.textContent = pct !== null
-        ? `${pct}% · ${formatBytes(progress!.bytesReceived)} / ${formatBytes(progress!.totalBytes)}`
-        : `${formatBytes(progress!.bytesReceived)}`;
-    } else if (state === 'retrying') {
-      // 自动重试中：让用户看到「在处理」而不是一个卡住的进度条
-      meta.innerHTML = '<span class="rn-retrying">网络异常，正在重试…</span>';
-    } else if (state === 'completed') {
-      meta.textContent = `已保存${progress?.totalBytes ? ` · ${formatBytes(progress.totalBytes)}` : ''}`;
-    } else if (state === 'failed') {
-      meta.innerHTML = `<span class="rn-err">下载失败</span>${progress?.error ? ` · ${progress.error}` : ''}`;
-    } else if (item.isStream) {
-      meta.innerHTML = `<span class="rn-err">HLS 流</span> · 暂不支持直接保存`;
-    } else {
-      const bits: string[] = [];
-      if (item.size) bits.push(formatBytes(item.size));
-      if (item.width && item.height) bits.push(`${item.width}×${item.height}`);
-      if (item.kind === 'video' && item.duration) bits.push(formatDuration(item.duration));
-      meta.textContent = bits.join(' · ') || '大小未知';
-    }
     main.appendChild(meta);
 
-    if (state === 'downloading') {
-      const bar = el('div', 'rn-row-bar');
-      const pct = percent(progress!) ?? 0;
-      const fill = el('i');
-      fill.style.width = `${pct}%`;
-      bar.appendChild(fill);
-      main.appendChild(bar);
-    }
+    // 进度条也常驻，用 hidden 切换
+    const bar = el('div', 'rn-row-bar');
+    const fill = el('i');
+    bar.appendChild(fill);
+    bar.hidden = state !== 'downloading';
+    main.appendChild(bar);
+
     row.appendChild(main);
 
-    // 右侧操作
+    // 右侧操作区：位置固定，内容随状态变。
+    // 外壳是 display:contents，布局跟以前完全一样。
+    const action = el('div', 'rn-row-action');
+    row.appendChild(action);
+
+    const refs: NoteRowRefs = { row, item, meta, bar, fill, action, done, state: '' };
+    this.noteRows.set(item.id, refs);
+    this.paintRow(refs, progress);
+    return row;
+  }
+
+  /** 把进度画到行上（整块渲染与增量更新共用这一份逻辑） */
+  private paintRow(refs: NoteRowRefs, progress?: DownloadProgress): void {
+    const item = refs.item;
+    const state = progress?.state ?? 'idle';
+    if (progress) refs.row.dataset.state = state;
+    else delete refs.row.dataset.state;
+
+    refs.meta.innerHTML = rowStatusHtml(item, progress);
+
+    const downloading = state === 'downloading';
+    refs.bar.hidden = !downloading;
+    refs.done.hidden = state !== 'completed';
+    if (downloading) {
+      const pct = percent(progress!) ?? 0;
+      refs.fill.style.width = `${pct}%`;
+    }
+
+    if (refs.state !== state) {
+      // 只有状态变了才重建右侧操作区
+      refs.state = state;
+      this.fillRowAction(refs, progress);
+    } else if (downloading && refs.pct) {
+      // 进度数字原地更新
+      const pct = percent(progress!);
+      refs.pct.textContent = pct !== null ? `${pct}%` : '…';
+    }
+  }
+
+  /** 行右侧的操作区：下载按钮 / 进度数字 / 重试按钮 */
+  private fillRowAction(refs: NoteRowRefs, progress?: DownloadProgress): void {
+    const item = refs.item;
+    const action = refs.action;
+    action.innerHTML = '';
+    refs.pct = undefined;
+    const state = progress?.state ?? 'idle';
+
     if (state === 'downloading') {
       const pct = percent(progress!);
       const label = el('div', 'rn-row-pct');
       label.textContent = pct !== null ? `${pct}%` : '…';
-      row.appendChild(label);
+      action.appendChild(label);
+      refs.pct = label;
     } else if (state === 'retrying') {
+      // 自动重试中：让用户看到「在处理」而不是一个卡住的进度条
       const label = el('div', 'rn-row-pct');
       label.innerHTML = icon('spinner', 14);
       label.classList.add('rn-spin');
-      row.appendChild(label);
+      action.appendChild(label);
     } else if (state === 'completed') {
       const btn = el('button', 'rn-btn');
       btn.type = 'button';
@@ -608,35 +718,29 @@ export class Panel {
       btn.setAttribute('aria-label', `打开浏览器下载列表：${item.filename}`);
       btn.innerHTML = icon('folder', 15);
       btn.addEventListener('click', () => this.callbacks.onOpenDownloads());
-      row.appendChild(btn);
+      action.appendChild(btn);
     } else if (state === 'failed') {
       const btn = el('button', 'rn-btn');
       btn.type = 'button';
       btn.dataset.variant = 'text';
       btn.innerHTML = `${icon('retry', 14)}重试`;
       btn.addEventListener('click', () => this.callbacks.onRetry(item.id));
-      row.appendChild(btn);
+      action.appendChild(btn);
     } else if (item.isStream) {
       const btn = el('button', 'rn-btn');
       btn.type = 'button';
       btn.dataset.variant = 'text';
       btn.innerHTML = '查看原因';
-      btn.addEventListener('click', () => {
-        this.callbacks.onCopyLink(item.url);
-      });
-      row.appendChild(btn);
+      btn.addEventListener('click', () => this.callbacks.onCopyLink(item.url));
+      action.appendChild(btn);
     } else {
       const btn = el('button', 'rn-btn');
       btn.type = 'button';
       btn.innerHTML = icon('download', 15);
       btn.setAttribute('aria-label', `下载 ${item.filename}`);
-      btn.addEventListener('click', () => {
-        this.callbacks.onDownloadItems([item]);
-      });
-      row.appendChild(btn);
+      btn.addEventListener('click', () => this.callbacks.onDownloadItems([item]));
+      action.appendChild(btn);
     }
-
-    return row;
   }
 
   /* ---------------------------- 工具条 ---------------------------- */
@@ -920,8 +1024,11 @@ export class Panel {
 
     const grid = el('div', 'rn-grid');
     if (visible.length <= 2) grid.dataset.cols = '2';
+    this.cardNodes.clear();
+    this.itemToCard.clear();
     for (const card of visible) {
       grid.appendChild(this.buildCard(card, vm));
+      for (const itemId of card.itemIds) this.itemToCard.set(itemId, card.noteId);
     }
     this.body.appendChild(grid);
 
@@ -1069,41 +1176,11 @@ export class Panel {
     node.appendChild(title);
 
     const meta = el('div', 'rn-card-meta');
-    const cardProgress = this.progressForCard(card, vm);
-    if (cardProgress) {
-      const p = cardProgress;
-      if (p.state === 'downloading') {
-        const pct = percent(p) ?? 0;
-        meta.textContent = `${pct}% · ${formatBytes(p.bytesReceived)}${p.speed ? ` · ${formatSpeed(p.speed)}` : ''}`;
-        const overlay = el('div', 'rn-card-overlay');
-        overlay.innerHTML = ringSvg(pct);
-        const text = el('div', 'rn-ring-text');
-        text.textContent = `${pct}%`;
-        overlay.appendChild(text);
-        imgWrap.appendChild(overlay);
-      } else if (p.state === 'completed') {
-        meta.innerHTML = `<span class="rn-ok">已完成</span>`;
-        const done = el('div', 'rn-check');
-        done.style.cssText = 'right:6px;top:6px;background:var(--success);border-color:var(--success);color:#fff';
-        done.innerHTML = icon('check', 12);
-        node.appendChild(done);
-      } else if (p.state === 'failed') {
-        meta.innerHTML = `<span class="rn-err">下载失败</span>`;
-      } else if (p.state === 'retrying') {
-        meta.innerHTML = `<span class="rn-resolving">${icon('spinner', 11)}重试中…</span>`;
-      } else if (p.state === 'queued') {
-        meta.textContent = '排队中';
-      }
-    } else if (card.likedCount) {
-      meta.textContent = `${card.likedCount} 赞`;
-    } else if (card.resolving) {
-      meta.innerHTML = `<span class="rn-resolving">${icon('spinner', 11)}解析中…</span>`;
-    } else if (card.failed) {
-      meta.innerHTML = `<span class="rn-err">解析失败</span>`;
-    } else {
-      meta.textContent = card.resolved ? '' : '待解析';
-    }
     node.appendChild(meta);
+
+    const refs: BatchCardRefs = { node, card, imgWrap, meta, state: '' };
+    this.cardNodes.set(card.noteId, refs);
+    this.paintCard(refs, vm);
 
     const toggle = () => {
       if (!this.lastBatchVm) return;
@@ -1122,6 +1199,73 @@ export class Panel {
     return node;
   }
 
+  /**
+   * 把下载状态画到卡片上（整块渲染与增量更新共用这一份逻辑）。
+   *
+   * 缩略图 img 绝不碰 —— 它一被重建就得重新解码，
+   * 几十张卡片一起重来，主线程会明显卡一下。
+   */
+  private paintCard(refs: BatchCardRefs, vm: BatchViewModel): void {
+    const card = refs.card;
+    const p = this.progressForCard(card, vm);
+    const state = p?.state ?? 'idle';
+
+    const status = cardStatusHtml(p);
+    if (status) {
+      refs.meta.innerHTML = status;
+    } else if (card.likedCount) {
+      refs.meta.textContent = `${card.likedCount} 赞`;
+    } else if (card.resolving) {
+      refs.meta.innerHTML = `<span class="rn-resolving">${icon('spinner', 11)}解析中…</span>`;
+    } else if (card.failed) {
+      refs.meta.innerHTML = '<span class="rn-err">解析失败</span>';
+    } else {
+      refs.meta.textContent = card.resolved ? '' : '待解析';
+    }
+
+    // 进度环：只改 dashoffset，SVG 不重建（CSS 里本来就有过渡动画）
+    const overlay = refs.imgWrap.querySelector('.rn-card-overlay');
+    if (state === 'downloading' && p) {
+      const pct = percent(p) ?? 0;
+      if (overlay) {
+        const arc = overlay.querySelector('.bar');
+        if (arc) arc.setAttribute('stroke-dashoffset', ringOffset(pct).toFixed(2));
+        const text = overlay.querySelector('.rn-ring-text');
+        if (text) text.textContent = `${pct}%`;
+      } else {
+        refs.imgWrap.appendChild(this.buildRingOverlay(pct));
+      }
+    } else if (overlay) {
+      overlay.remove();
+    }
+
+    // 完成角标
+    const done = refs.node.querySelector('.rn-card-done');
+    if (state === 'completed') {
+      if (!done) refs.node.appendChild(this.buildCardDone());
+    } else if (done) {
+      done.remove();
+    }
+  }
+
+  /** 卡片上的进度环 */
+  private buildRingOverlay(pct: number): HTMLElement {
+    const overlay = el('div', 'rn-card-overlay');
+    overlay.innerHTML = ringSvg(pct);
+    const text = el('div', 'rn-ring-text');
+    text.textContent = `${pct}%`;
+    overlay.appendChild(text);
+    return overlay;
+  }
+
+  /** 卡片右上角的完成角标 */
+  private buildCardDone(): HTMLElement {
+    const done = el('div', 'rn-check rn-card-done');
+    done.style.cssText = 'right:6px;top:6px;background:var(--success);border-color:var(--success);color:#fff';
+    done.innerHTML = icon('check', 12);
+    return done;
+  }
+
   private progressForCard(card: BatchCard, vm: BatchViewModel): DownloadProgress | undefined {
     for (const itemId of card.itemIds) {
       const p = vm.progress.get(itemId);
@@ -1132,6 +1276,43 @@ export class Panel {
       }
     }
     return undefined;
+  }
+
+  /**
+   * 只更新进度，不重建面板。
+   *
+   * 下载进度每秒变好几次。整块重画的话，几十张卡片的 <img> 会被反复
+   * 销毁重建 —— 图片要重新解码，主线程直接卡住，滚动和点击都跟着顿。
+   * 这里只改变化的那几行 / 那几张卡，缩略图一根手指都不动。
+   */
+  patchProgress(changed: DownloadProgress[]): void {
+    if (changed.length === 0) return;
+
+    if (this.mode === 'note') {
+      const vm = this.lastNoteVm;
+      if (!vm) return;
+      for (const p of changed) {
+        const refs = this.noteRows.get(p.itemId);
+        if (!refs) continue;
+        this.paintRow(refs, p);
+      }
+      this.renderNoteFooter(vm);
+      return;
+    }
+
+    const vm = this.lastBatchVm;
+    if (!vm) return;
+    const touched = new Set<string>();
+    for (const p of changed) {
+      const noteId = this.itemToCard.get(p.itemId);
+      if (noteId) touched.add(noteId);
+    }
+    for (const noteId of touched) {
+      const refs = this.cardNodes.get(noteId);
+      if (!refs) continue;
+      this.paintCard(refs, vm);
+    }
+    this.renderBatchFooter(vm);
   }
 
   private renderBatchFooter(vm: BatchViewModel): void {

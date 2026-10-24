@@ -634,11 +634,9 @@ class App {
 
     this.panel.setFabBackgroundProgress(running > 0 || settled < total ? pct : null);
 
-    if (this.pageKind === 'note') {
-      this.renderNote();
-    } else {
-      this.panel.renderBatch(this.batch);
-    }
+    // 只补变化的那几行 / 那几张卡，不整块重画 ——
+    // 整块重画会把几十张卡片的缩略图反复重建，主线程会明显卡顿
+    this.panel.patchProgress(list);
 
     if (running === 0 && total > 0 && settled === total) {
       this.panel.setFabBackgroundProgress(null);

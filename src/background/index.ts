@@ -10,6 +10,7 @@ import {
   retryItem,
   saveSettings,
   startDownloads,
+  watchSettings,
 } from './downloader';
 
 /* ------------------------------------------------------------------ */
@@ -17,6 +18,7 @@ import {
 /* ------------------------------------------------------------------ */
 
 attachDownloadListeners();
+watchSettings();
 void initDownloader();
 
 /* ------------------------------------------------------------------ */

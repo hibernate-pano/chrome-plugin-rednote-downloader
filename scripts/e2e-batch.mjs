@@ -516,13 +516,15 @@ async function main() {
     }
     check('解析过程有可见进度', Boolean(resolvingUi?.resolving), JSON.stringify(resolvingUi));
 
-    // 等下载落盘
+    // 等下载落盘。
+    // 注意：Chrome 下一个正在下载的文件会先落成 xxx.crdownload，
+    // 那不算下完 —— 数文件的时候必须把它排除，否则会在视频还没下完时就「达标」
     let after = before;
     let settled = false;
     for (let i = 0; i < 60; i += 1) {
       await sleep(700);
       after = walk(downloadRoot());
-      const fresh = after.filter((f) => !before.includes(f));
+      const fresh = after.filter((f) => !before.includes(f) && !f.endsWith('.crdownload'));
       if (fresh.length >= 4) {
         settled = true;
         break;

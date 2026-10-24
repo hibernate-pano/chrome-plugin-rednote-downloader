@@ -291,6 +291,9 @@ button { font-family: inherit; }
 .rn-row-bar { margin-top: 5px; height: 4px; border-radius: 3px; background: var(--bg-sunken); overflow: hidden; }
 .rn-row-bar > i { display: block; height: 100%; width: 0; background: var(--brand); transition: width .2s linear; }
 .rn-row-pct { font-size: 12px; font-weight: 600; color: var(--brand-text); flex: none; min-width: 34px; text-align: right; }
+/* 右侧操作区的外壳：display:contents 让里面的按钮仍然直接参与 flex 布局，
+   这样进度更新时可以只换操作区的内容，不必重建整行 */
+.rn-row-action { display: contents; }
 
 /* ============ 按钮 ============ */
 

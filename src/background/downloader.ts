@@ -14,8 +14,22 @@ const STATS_KEY = 'rednote.session.stats';
 const SETTINGS_KEY = 'rednote.settings';
 const HISTORY_KEY = 'rednote.history';
 
-/** 进度轮询间隔（毫秒） */
-const POLL_INTERVAL = 450;
+/**
+ * 进度刷新节拍（毫秒）。
+ *
+ * 一次查询就能覆盖所有在跑的下载，所以这个节拍只跟「进度要多新鲜」有关，
+ * 跟并发数、文件数都无关 —— 之前是每个在跑的下载各查一次，
+ * 于是查询量 = 事件数 × 并发数，几十个文件就能把浏览器拖慢。
+ */
+const TICK_INTERVAL = 300;
+
+/**
+ * 两次刷新之间的最小间隔。
+ *
+ * 下载事件是密集的（每个文件至少 filename + state 两条），
+ * 不合并的话每个事件都会打一次 chrome.downloads.search。
+ */
+const MIN_TICK_GAP = 250;
 
 /**
  * 可以自动重试的中断原因 —— 网络/服务端的瞬时故障。
@@ -42,59 +56,129 @@ interface TaskRecord {
   summary: TaskSummary;
   /** itemId → 原始下载参数 */
   sources: Map<string, DownloadTaskItem>;
-  /** 已经重试过的项，避免无限重试 */
-  retried: Set<string>;
   /** itemId → 已经自动重试的次数 */
   attempts: Map<string, number>;
   /** 上一次采样，用于算速度 */
   lastTick: Map<string, { at: number; bytes: number }>;
+  /** 变化过的条目：广播只发这些，页面也只需要补这些 */
+  dirty: Set<string>;
+  /** 上次广播时间，用来节流 */
+  lastBroadcastAt: number;
+  /** 上次全量同步时间：页面刷新后靠它把进度补齐 */
+  lastFullSyncAt: number;
 }
 
 const tasks = new Map<string, TaskRecord>();
-let pollTimer: ReturnType<typeof setInterval> | null = null;
-let lastBroadcast = 0;
+
+/** 下一次刷新的定时器（事件与节拍共用，天然合并） */
+let tickTimer: ReturnType<typeof setTimeout> | null = null;
+/** 兜底节拍：下载期间没有事件时，靠它刷新进度条 */
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+/** 上一次刷新的时间，用来算最小间隔 */
+let lastTickAt = 0;
+/** 刷新进行中：防止两个刷新同时结算同一个下载（会把完成数数重） */
+let ticking = false;
+
+/** 设置缓存：pump 每完成一个文件就会读一次设置，没必要每次都走存储 */
+let settingsCache: Settings | null = null;
+
+/** 本次会话的下载统计：内存里累加，落盘合并到任务快照那一次 */
+const statsCache = { completed: 0, bytes: 0 };
+let statsLoaded = false;
 
 /* ------------------------------------------------------------------ */
 /* 持久化                                                              */
 /* ------------------------------------------------------------------ */
 
+/** 落盘节流：下载期间状态变得很勤，全量写会把 storage 的写配额打爆 */
+const PERSIST_INTERVAL = 500;
+
+/** 多久补一次全量进度（页面刷新后靠它把进度补齐） */
+const FULL_SYNC_INTERVAL = 5000;
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let persistPending = false;
+
+/** 立刻落盘 */
 async function persist(): Promise<void> {
   const snapshot = [];
   for (const task of tasks.values()) {
     snapshot.push({
       ...task,
       running: Array.from(task.running.entries()),
-      sources: Array.from(task.sources.entries()),
-      retried: Array.from(task.retried),
+      // 只留重启后真正用得上的字段：url / 文件名 / 大小。
+      // 备注、作者这些纯展示字段没必要跟着每次落盘走。
+      sources: Array.from(task.sources.entries()).map(([itemId, src]) => [
+        itemId,
+        { itemId: src.itemId, url: src.url, filename: src.filename, size: src.size, kind: src.kind },
+      ]),
       attempts: Array.from(task.attempts.entries()),
       lastTick: Array.from(task.lastTick.entries()),
+      dirty: Array.from(task.dirty),
     });
   }
-  await chrome.storage.session.set({ [STATE_KEY]: snapshot });
+  try {
+    await chrome.storage.session.set({
+      [STATE_KEY]: snapshot,
+      [STATS_KEY]: { completed: statsCache.completed, bytes: statsCache.bytes },
+    });
+  } catch {
+    /* 配额爆了也不能让下载停下来 */
+  }
+}
+
+/**
+ * 节流落盘。
+ *
+ * 写次数是有配额的（每分钟 120 次），一个批次几十上百个文件，
+ * 每变一次状态就写一次会直接写爆配额 —— 配额一爆，快照就停在旧版本，
+ * Service Worker 被杀之后恢复出来的状态是错的。
+ */
+function schedulePersist(): void {
+  persistPending = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    if (!persistPending) return;
+    persistPending = false;
+    void persist();
+  }, PERSIST_INTERVAL);
+  (persistTimer as unknown as { unref?: () => void })?.unref?.();
 }
 
 async function restore(): Promise<void> {
   try {
     const raw = await chrome.storage.session.get(STATE_KEY);
     const list = raw?.[STATE_KEY];
-    if (!Array.isArray(list)) return;
-    for (const item of list) {
-      const record: TaskRecord = {
-        ...item,
-        running: new Map(item.running ?? []),
-        sources: new Map(item.sources ?? []),
-        retried: new Set(item.retried ?? []),
-        attempts: new Map(item.attempts ?? []),
-        lastTick: new Map(item.lastTick ?? []),
-      };
-      tasks.set(record.taskId, record);
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        const record: TaskRecord = {
+          ...item,
+          running: new Map(item.running ?? []),
+          sources: new Map(item.sources ?? []),
+          attempts: new Map(item.attempts ?? []),
+          lastTick: new Map(item.lastTick ?? []),
+          dirty: new Set(item.dirty ?? []),
+          lastBroadcastAt: 0,
+          lastFullSyncAt: 0,
+        };
+        tasks.set(record.taskId, record);
+      }
     }
+    const stats = (await chrome.storage.session.get(STATS_KEY))?.[STATS_KEY];
+    statsCache.completed = Number(stats?.completed ?? 0);
+    statsCache.bytes = Number(stats?.bytes ?? 0);
+    statsLoaded = true;
   } catch {
     /* ignore */
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 设置                                                                */
+/* ------------------------------------------------------------------ */
+
 export async function getSettings(): Promise<Settings> {
+  if (settingsCache) return settingsCache;
   try {
     const raw = await chrome.storage.local.get(SETTINGS_KEY);
     const stored = (raw?.[SETTINGS_KEY] ?? {}) as Partial<Settings> & {
@@ -107,9 +191,11 @@ export async function getSettings(): Promise<Settings> {
       migrated.saveStructure = stored.folderByNote === false ? 'flat' : 'perNote';
     }
     delete (migrated as { folderByNote?: boolean }).folderByNote;
-    return { ...DEFAULT_SETTINGS, ...migrated };
+    settingsCache = { ...DEFAULT_SETTINGS, ...migrated };
+    return settingsCache;
   } catch {
-    return { ...DEFAULT_SETTINGS };
+    settingsCache = { ...DEFAULT_SETTINGS };
+    return settingsCache;
   }
 }
 
@@ -117,8 +203,21 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
   const current = await getSettings();
   const next = { ...current, ...patch };
   await chrome.storage.local.set({ [SETTINGS_KEY]: next });
+  settingsCache = next;
   return next;
 }
+
+/** 设置页可能直接在 storage.local 上改，缓存得跟着失效 */
+export function watchSettings(): void {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (SETTINGS_KEY in changes) settingsCache = null;
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 会话统计                                                            */
+/* ------------------------------------------------------------------ */
 
 export interface SessionStats {
   completed: number;
@@ -126,24 +225,27 @@ export interface SessionStats {
 }
 
 export async function getSessionStats(): Promise<SessionStats> {
-  try {
-    const raw = await chrome.storage.session.get(STATS_KEY);
-    const stats = raw?.[STATS_KEY];
-    return {
-      completed: Number(stats?.completed ?? 0),
-      bytes: Number(stats?.bytes ?? 0),
-    };
-  } catch {
-    return { completed: 0, bytes: 0 };
+  if (!statsLoaded) {
+    try {
+      const stats = (await chrome.storage.session.get(STATS_KEY))?.[STATS_KEY];
+      statsCache.completed = Number(stats?.completed ?? 0);
+      statsCache.bytes = Number(stats?.bytes ?? 0);
+      statsLoaded = true;
+    } catch {
+      /* ignore */
+    }
   }
+  return { completed: statsCache.completed, bytes: statsCache.bytes };
 }
 
-async function bumpSessionStats(bytes: number): Promise<void> {
-  const stats = await getSessionStats();
-  await chrome.storage.session.set({
-    [STATS_KEY]: { completed: stats.completed + 1, bytes: stats.bytes + Math.max(0, bytes) },
-  });
+function bumpSessionStats(bytes: number): void {
+  statsCache.completed += 1;
+  statsCache.bytes += Math.max(0, bytes);
 }
+
+/* ------------------------------------------------------------------ */
+/* 历史                                                                */
+/* ------------------------------------------------------------------ */
 
 export async function getHistory(): Promise<HistoryEntry[]> {
   try {
@@ -165,15 +267,30 @@ async function pushHistory(entry: HistoryEntry): Promise<void> {
 /* 广播                                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 把变化告诉页面。
+ *
+ * 只发变化的那几条：之前每次都发全量，几十个文件时每条消息都是几十 KB，
+ * 而且页面每收一条就把整个面板重画一遍。
+ */
 async function broadcast(record: TaskRecord, force = false): Promise<void> {
   if (record.tabId === undefined) return;
   const now = Date.now();
-  if (!force && now - lastBroadcast < 200) return;
-  lastBroadcast = now;
+  if (!force && now - record.lastBroadcastAt < 200) return;
+  // 平时只发变化的那几条；但每隔几秒补一次全量 ——
+  // 用户在下载途中刷新了页面的话，页面得能把进度补齐
+  const full = force || now - record.lastFullSyncAt >= FULL_SYNC_INTERVAL;
+  const items = full
+    ? record.items
+    : record.items.filter((i) => record.dirty.has(i.itemId));
+  if (items.length === 0) return;
+  record.lastBroadcastAt = now;
+  if (full) record.lastFullSyncAt = now;
+  record.dirty.clear();
   try {
     await chrome.tabs.sendMessage(record.tabId, {
       type: 'DOWNLOAD_PROGRESS',
-      progress: record.items,
+      progress: items,
     });
   } catch {
     /* 页面可能已关闭 */
@@ -210,15 +327,21 @@ export async function startDownloads(
       failed: 0,
       startedAt: Date.now(),
     },
-    retried: new Set(),
     attempts: new Map(),
     lastTick: new Map(),
+    dirty: new Set(items.map((item) => item.itemId)),
+    lastBroadcastAt: 0,
+    lastFullSyncAt: 0,
   };
 
   tasks.set(taskId, record);
-  await persist();
+  // 先把完整清单给页面，再启动下载 ——
+  // 页面得先知道一共要下多少个，进度才有分母
   await broadcast(record, true);
-  void pump(record);
+  await pump(record);
+  // 在途下载的 id 记在 running 里，Service Worker 被杀之后要靠它对账，
+  // 所以这里必须立刻落盘一次，不能等节流
+  await persist();
 }
 
 async function pump(record: TaskRecord): Promise<void> {
@@ -235,6 +358,7 @@ async function pump(record: TaskRecord): Promise<void> {
       item.state = 'failed';
       item.error = '任务数据丢失';
       record.summary.failed += 1;
+      record.dirty.add(itemId);
       continue;
     }
 
@@ -248,26 +372,57 @@ async function pump(record: TaskRecord): Promise<void> {
       item.downloadId = downloadId;
       item.state = 'downloading';
       record.running.set(downloadId, itemId);
+      record.dirty.add(itemId);
     } catch (err) {
       item.state = 'failed';
       item.error = err instanceof Error ? err.message : String(err);
       record.summary.failed += 1;
+      record.dirty.add(itemId);
     }
   }
 
-  ensurePolling();
-  await persist();
-  await broadcast(record, true);
+  ensureHeartbeat();
+  schedulePersist();
+  await broadcast(record);
   await checkFinished(record);
 }
 
 /* ------------------------------------------------------------------ */
-/* 进度轮询                                                            */
+/* 进度刷新                                                            */
 /* ------------------------------------------------------------------ */
 
 /**
+ * 一次查回所有在跑的下载。
+ *
+ * chrome.downloads.search 的 id 字段不接受数组（传数组直接抛 TypeError），
+ * 所以这里用「最近 N 条 + 按需兜底」：批量下载总是最近启动的那批，
+ * 正常都落在最近 N 条里；万一用户同时在下载别的东西把我们挤出去了，
+ * 再按 id 单独补查那几条。
+ */
+async function fetchRunning(
+  active: Array<{ downloadId: number }>,
+): Promise<Map<number, chrome.downloads.DownloadItem>> {
+  const limit = Math.max(20, active.length * 4 + 10);
+  const map = new Map<number, chrome.downloads.DownloadItem>();
+  try {
+    const list = await chrome.downloads.search({ limit, orderBy: ['-startTime'] });
+    for (const info of list) map.set(info.id, info);
+  } catch {
+    return map;
+  }
+  const missing = active.filter((a) => !map.has(a.downloadId));
+  if (missing.length > 0) {
+    const extra = await Promise.all(
+      missing.map((a) => chrome.downloads.search({ id: a.downloadId }).catch(() => [])),
+    );
+    for (const items of extra) for (const info of items) map.set(info.id, info);
+  }
+  return map;
+}
+
+/**
  * chrome.downloads.onChanged 的 delta 里没有 bytesReceived，
- * 必须用 chrome.downloads.search 拿实时进度。
+ * 进度必须用 chrome.downloads.search 拿。
  */
 async function poll(): Promise<void> {
   const active: Array<{ record: TaskRecord; downloadId: number; itemId: string }> = [];
@@ -278,20 +433,13 @@ async function poll(): Promise<void> {
   }
   if (active.length === 0) return;
 
-  let items: chrome.downloads.DownloadItem[] = [];
-  try {
-    const results = await Promise.all(
-      active.map((a) => chrome.downloads.search({ id: a.downloadId }).catch(() => [])),
-    );
-    items = results.flat();
-  } catch {
-    return;
-  }
+  const infos = await fetchRunning(active);
+  if (infos.size === 0) return;
 
   const now = Date.now();
-  for (const info of items) {
-    const entry = active.find((a) => a.downloadId === info.id);
-    if (!entry) continue;
+  for (const entry of active) {
+    const info = infos.get(entry.downloadId);
+    if (!info) continue;
     const item = entry.record.items.find((i) => i.itemId === entry.itemId);
     if (!item) continue;
 
@@ -301,12 +449,22 @@ async function poll(): Promise<void> {
     const prev = entry.record.lastTick.get(entry.itemId) ?? { at: now, bytes: received };
     const dt = (now - prev.at) / 1000;
     if (dt >= 0.4) {
-      item.speed = Math.max(0, (received - prev.bytes) / dt);
+      const speed = Math.max(0, (received - prev.bytes) / dt);
+      if (item.speed !== speed) {
+        item.speed = speed;
+        entry.record.dirty.add(entry.itemId);
+      }
       entry.record.lastTick.set(entry.itemId, { at: now, bytes: received });
     }
 
-    item.bytesReceived = received;
-    if (total !== item.totalBytes) item.totalBytes = total;
+    if (item.bytesReceived !== received) {
+      item.bytesReceived = received;
+      entry.record.dirty.add(entry.itemId);
+    }
+    if (total !== item.totalBytes) {
+      item.totalBytes = total;
+      entry.record.dirty.add(entry.itemId);
+    }
     if (info.filename) item.filename = info.filename;
 
     if (info.state === 'complete') {
@@ -316,25 +474,28 @@ async function poll(): Promise<void> {
         entry.record.running.delete(info.id);
         item.state = 'failed';
         item.error = '下载完成但文件为空，已标记为失败';
+        item.speed = undefined;
         entry.record.summary.failed += 1;
-        void persist();
-        void broadcast(entry.record, true);
-        void pump(entry.record);
-        void checkFinished(entry.record);
+        entry.record.dirty.add(entry.itemId);
+        await broadcast(entry.record);
+        await pump(entry.record);
+        await checkFinished(entry.record);
         continue;
       }
       item.state = 'completed';
       item.bytesReceived = info.bytesReceived ?? received;
       item.totalBytes = info.totalBytes && info.totalBytes > 0 ? info.totalBytes : item.totalBytes;
+      item.speed = undefined;
       entry.record.running.delete(info.id);
       entry.record.summary.completed += 1;
-      void bumpSessionStats(info.bytesReceived ?? 0);
-      void persist();
-      void broadcast(entry.record, true);
-      void pump(entry.record);
-      void checkFinished(entry.record);
+      entry.record.dirty.add(entry.itemId);
+      bumpSessionStats(info.bytesReceived ?? 0);
+      await broadcast(entry.record);
+      await pump(entry.record);
+      await checkFinished(entry.record);
     } else if (info.state === 'interrupted') {
       entry.record.running.delete(info.id);
+      item.speed = undefined;
       const error = info.error ?? '下载中断';
       if (error === 'USER_CANCELED') {
         item.state = 'cancelled';
@@ -348,8 +509,8 @@ async function poll(): Promise<void> {
           item.downloadId = undefined;
           item.bytesReceived = 0;
           entry.record.queue.push(entry.itemId);
-          void persist();
-          void broadcast(entry.record, true);
+          entry.record.dirty.add(entry.itemId);
+          await broadcast(entry.record);
           scheduleRetry(entry.record, 1000 * 2 ** (attempts - 1));
           continue;
         }
@@ -357,10 +518,10 @@ async function poll(): Promise<void> {
         item.error = error;
         entry.record.summary.failed += 1;
       }
-      void persist();
-      void broadcast(entry.record, true);
-      void pump(entry.record);
-      void checkFinished(entry.record);
+      entry.record.dirty.add(entry.itemId);
+      await broadcast(entry.record);
+      await pump(entry.record);
+      await checkFinished(entry.record);
     }
   }
 }
@@ -374,19 +535,49 @@ function scheduleRetry(record: TaskRecord, delayMs: number): void {
   (timer as unknown as { unref?: () => void })?.unref?.();
 }
 
-function ensurePolling(): void {
+/**
+ * 安排一次刷新。
+ *
+ * 下载事件和兜底节拍都走这里，天然会合并 —— 一串密集的事件
+ * 只会变成一次 downloads.search。
+ */
+function scheduleTick(): void {
+  if (tickTimer) return;
+  const wait = Math.max(0, MIN_TICK_GAP - (Date.now() - lastTickAt));
+  tickTimer = setTimeout(() => {
+    tickTimer = null;
+    void tick();
+  }, wait);
+  (tickTimer as unknown as { unref?: () => void })?.unref?.();
+}
+
+/** 真正去查一次进度 */
+async function tick(): Promise<void> {
+  if (ticking) return;
+  ticking = true;
+  lastTickAt = Date.now();
+  try {
+    await poll();
+  } catch {
+    /* ignore */
+  } finally {
+    ticking = false;
+  }
+}
+
+function ensureHeartbeat(): void {
   const hasActive = [...tasks.values()].some((t) => t.running.size > 0 || t.queue.length > 0);
   if (!hasActive) {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
     }
     return;
   }
-  if (pollTimer) return;
-  pollTimer = setInterval(() => void poll(), POLL_INTERVAL);
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => scheduleTick(), TICK_INTERVAL);
   // Node 下（单元测试）定时器会吊住进程；浏览器里 setInterval 返回数字，没有这方法
-  (pollTimer as unknown as { unref?: () => void })?.unref?.();
+  (heartbeatTimer as unknown as { unref?: () => void })?.unref?.();
 }
 
 /* ------------------------------------------------------------------ */
@@ -395,8 +586,11 @@ function ensurePolling(): void {
 
 export function attachDownloadListeners(): void {
   chrome.downloads.onChanged.addListener((delta) => {
-    // 状态变化由轮询里的 downloads.search 统一处理，这里只做即时唤醒
-    void poll();
+    // 事件本身不带进度数字，真正要拿还得查一次；
+    // 所以这里只负责「唤醒」，由合并后的定时器统一去查。
+    // 之前是每个事件直接打一次全量查询，查询量 = 事件数 × 并发数。
+    const state = (delta as { state?: { current?: string } }).state?.current;
+    if (state === 'complete' || state === 'interrupted') scheduleTick();
   });
 }
 
@@ -422,7 +616,7 @@ async function checkFinished(record: TaskRecord): Promise<void> {
   });
   await persist();
   await broadcast(record, true);
-  ensurePolling();
+  ensureHeartbeat();
   if (record.tabId !== undefined) {
     try {
       await chrome.tabs.sendMessage(record.tabId, { type: 'TASK_SUMMARY', summary: record.summary });
@@ -444,7 +638,10 @@ export async function cancelTask(taskId: string): Promise<void> {
   }
   record.queue = [];
   record.items.forEach((item) => {
-    if (item.state === 'queued') item.state = 'cancelled';
+    if (item.state === 'queued') {
+      item.state = 'cancelled';
+      record.dirty.add(item.itemId);
+    }
   });
   await persist();
   await broadcast(record, true);
@@ -468,6 +665,7 @@ export async function retryItem(taskId: string, itemId: string): Promise<void> {
   item.totalBytes = source.size ?? -1;
   record.summary.failed = Math.max(0, record.summary.failed - 1);
   record.queue.push(itemId);
+  record.dirty.add(itemId);
   await persist();
   await broadcast(record, true);
   await pump(record);
@@ -519,5 +717,5 @@ export async function initDownloader(): Promise<void> {
     await reconcile(record);
     void pump(record);
   }
-  ensurePolling();
+  ensureHeartbeat();
 }

@@ -8,3 +8,6 @@ build/
 .playwright-mcp/
 .research/
 .pi/
+
+# 截图等临时产物
+.tmp/
