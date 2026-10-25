@@ -205,23 +205,21 @@ const handlers: Record<string, Handler> = {
   /**
    * 取单篇笔记详情（主页批量下载时用）。
    *
-   * 主路：抓笔记页的 HTML，直接把内联的 __INITIAL_STATE__ 解析出来。
-   * 笔记页是服务端渲染的，状态就写在 HTML 里 —— 拿 HTML 只需要网络开销，
-   * 不需要浏览器真的去渲染一个页面。
+   * 主路：开隐藏 iframe 加载真实笔记页，读它**渲染后**的状态。
+   * 兜底：抓笔记页的 HTML，从内联的 __INITIAL_STATE__ 里抠。
    *
-   * 兜底：开隐藏 iframe 加载笔记页，读它渲染后的状态。
+   * **为什么主路是 iframe 而不是抓 HTML**（2026-10-25 改）：
+   * iframe 读到的是「用户眼睛看到的那份数据」—— 页面脚本跑完、XHR 回来之后的状态。
+   * 抓 HTML 读到的是服务端渲染出来的那一份，两份**不一定一样**
+   * （地址可能不同、清晰度可能不同、签名可能更早过期）。
+   * 用户反馈「现在的下载效果还不如 1.0.0」，而 1.0.0 走的就是 iframe ——
+   * 那就让 iframe 说了算，抓 HTML 只在它失败时兜底。
    *
-   * 为什么主路换成抓 HTML：主页批量几百条笔记时，
-   * 每条都开一个 iframe 等于让浏览器加载并执行几百个完整页面 ——
-   * 实测几百条之后浏览器会明显变卡、页面请求都发不出去。
-   * 抓 HTML 是同样数量的轻量请求，没有渲染、没有脚本执行，快一个量级。
-   *
-   * **但这条路不能用「每条笔记都试一次」的笨办法**：
-   * 抓 HTML 和 iframe 加载走的是同一个站点、同一个连接池（浏览器每个域名 6 条）。
-   * 多打一遍等于把站点的压力翻倍，iframe 反而被挤掉 ——
-   * 表现出来就是「解析经常失败」。
-   * 所以先试第一条，判定这条路通不通，之后整个会话只走一条路。
-   * （判定依据见 fetchPathState）
+   * **快路要自己证明自己可信才准用**：
+   * 第一次解析时两条路都跑一遍，把媒体地址逐条比对 ——
+   * 完全一致才说明「SSR 里那份和页面渲染那份是同一份」，之后才允许快路接手
+   * （这样几百条笔记不用开几百个 iframe）；
+   * 不一致就整场不用快路（宁可慢，也不能下到不一样的东西）。
    *
    * 为什么不直接调站点 API：页面的 X-s 签名依赖一整套反爬头（mnsv2 / a1 /
    * X-S-Common），site 改一次就失效，不值得依赖。
@@ -231,78 +229,103 @@ const handlers: Record<string, Handler> = {
     const { noteId, xsecToken } = params ?? {};
     if (!noteId) return { ok: false, error: 'missing noteId' };
 
-    // 整条链路的预算：抓 HTML 最多 5s，剩下的时间留给隐藏 iframe。
-    // 桥接层给这个调用单独放宽了超时（默认 15s 会在这条链路上被吃光）。
+    // 整条链路的预算。桥接层给这个调用单独放宽了超时（默认 15s 会在这条链路上被吃光）。
     const deadline = Date.now() + NOTE_DETAIL_BUDGET_MS;
 
-    // 主路：抓 HTML
-    if (fetchPathState !== 'unusable') {
-      try {
-        const result = await loadNoteViaFetch(noteId, xsecToken);
-        if (result.note) {
-          fetchMisses = 0;
-          fetchPathState = 'usable';
-          return { ok: true, note: result.note, via: 'fetch' };
-        }
-        if (result.verdict === 'broken') {
-          // 这条路本身坏了（请求失败、HTML 里连状态都没有）—— 整场都别再试
-          fetchPathState = 'unusable';
-        } else {
-          // 抓到了 HTML，但里面没有这条笔记。
-          // 可能是这条笔记特殊，也可能是站点压根不把详情渲染进 HTML ——
-          // 连着几次都这样就别再试了（每次试都是白打一个请求）。
-          fetchMisses += 1;
-          if (fetchMisses >= FETCH_MISS_LIMIT) fetchPathState = 'unusable';
-        }
-      } catch {
-        fetchPathState = 'unusable';
+    // ---- 快路已经自证过一致 → 直接走快路（几百条笔记不用开几百个 iframe）----
+    if (fastPathState === 'usable') {
+      const viaFetch = await fetchNotePage(noteId, xsecToken).catch(() => null);
+      if (viaFetch?.note) {
+        parsePath = 'fetch';
+        usedPaths.add('fetch');
+        return { ok: true, note: viaFetch.note, via: 'fetch' };
       }
+      // 「这条笔记的 HTML 里没有它」不代表快路坏了（可能这条笔记本来就没媒体）——
+      // 只有请求本身失败才说明快路坏了，那才需要退回主路。
+      if (viaFetch?.verdict === 'broken') fastPathState = 'unusable';
     }
 
-    // 兜底：隐藏 iframe
-    try {
-      const note = await loadNoteViaFrame(noteId, xsecToken, deadline);
-      if (note) return { ok: true, note, via: 'iframe' };
-    } catch {
-      /* ignore */
+    // ---- 主路：隐藏 iframe（1.0.0 就是这么干的）----
+    const viaFrame = await loadNoteViaFrame(noteId, xsecToken, deadline).catch(() => null);
+    if (viaFrame && hasMedia(viaFrame)) {
+      // 页面给的东西就是权威结果。
+      // 顺便让快路自证一次（不阻塞这一条：验证是后台跑的，结果只影响后面的笔记）。
+      if (fastPathState === 'unknown' && viaFrame.videos.length > 0) {
+        void startValidation(noteId, xsecToken, viaFrame);
+      }
+      parsePath = 'iframe';
+      usedPaths.add('iframe');
+      return { ok: true, note: viaFrame, via: 'iframe' };
+    }
+
+    // ---- 兜底：抓 HTML（页面没给出媒体的时候救一把）----
+    if (fastPathState !== 'unusable') {
+      const viaFetch = await fetchNotePage(noteId, xsecToken).catch(() => null);
+      if (viaFetch?.note) {
+        parsePath = 'fetch';
+        usedPaths.add('fetch');
+        return { ok: true, note: viaFetch.note, via: 'fetch' };
+      }
+      if (viaFetch?.verdict === 'broken') fastPathState = 'unusable';
+    }
+
+    // ---- 页面给了一个空壳：笔记在，但媒体还没出来（或者这条确实没有媒体）----
+    // 这不是失败：解析确实成功了，只是这条没有可下载的东西。
+    // 界面会写「未取到资源」，跟「解析失败」区分开。
+    if (viaFrame) {
+      parsePath = 'iframe';
+      usedPaths.add('iframe');
+      return { ok: true, note: viaFrame, via: 'iframe' };
     }
 
     return { ok: false, error: '无法获取笔记详情' };
   },
+
+  /**
+   * 这一场解析走的是哪条路（界面上要显示出来）。
+   *
+   * 「快路」= 抓 HTML；「页面渲染」= 隐藏 iframe。
+   * 显示出来是因为两条路给的东西**可能不一样** ——
+   * 用户一眼就能看出这批内容是不是按页面看到的样子下的。
+   */
+  'api.parsePath': () => ({
+    path: parsePath,
+    /** 这一场里实际用过的路 */
+    paths: Array.from(usedPaths),
+    fastPathState,
+    /** 快路是否被证明与页面渲染结果一致 */
+    fastPathTrusted: fastPathState === 'usable',
+  }),
 };
 
-/** 解析一条笔记的总预算（毫秒）：抓 HTML + 隐藏 iframe 加起来不能超过它 */
+/** 解析一条笔记的总预算（毫秒）：隐藏 iframe + 抓 HTML 加起来不能超过它 */
 const NOTE_DETAIL_BUDGET_MS = 20000;
 /** 抓 HTML 单次请求的上限 —— 请求卡住时不能把整条链路耗光 */
 const FETCH_TIMEOUT_MS = 5000;
 /** 隐藏 iframe 等媒体补齐的上限 */
 const FRAME_WAIT_MS = 10000;
-/** 连续几次「抓到了 HTML 但没有这条笔记」之后，判定快路不可用 */
-const FETCH_MISS_LIMIT = 3;
+/** 隐藏 iframe 里笔记已经出现、但媒体还没补上时，最多再等多久 */
+const FRAME_MEDIA_WAIT_MS = 4000;
 
 /**
- * 抓 HTML 这条路通不通。
+ * 这一场解析实际走的是哪条路。
+ */
+let parsePath: 'iframe' | 'fetch' | 'none' = 'none';
+
+/** 这一场里实际用过的路（两条都用过就都记上） */
+const usedPaths = new Set<'iframe' | 'fetch'>();
+
+/**
+ * 抓 HTML 这条路的状态。
  *
- * 'unknown'  —— 还没试过
- * 'usable'   —— 抓到的 HTML 里有这条笔记的详情，往后就走快路
- * 'unusable' —— 这条路对站点不管用，整场都别再试 ——
+ * 'unknown'  —— 还没自证过（默认：走页面，跟 1.0.0 一样）
+ * 'usable'   —— 已经证明：抓到的 HTML 里的媒体地址，与页面渲染出来的**完全一致**，
+ *               之后可以放心用快路（几百条笔记就不用开几百个 iframe）
+ * 'unusable' —— 证明过对不上（或者压根抓不到），整场都别再试 ——
  *               每条笔记白打一个请求，还会跟 iframe 抢连接池，
  *               把解析成功率拖下去。
  */
-let fetchPathState: 'unknown' | 'usable' | 'unusable' = 'unknown';
-
-/** 连续「抓到 HTML 但没有目标笔记」的次数 */
-let fetchMisses = 0;
-
-/**
- * 读一下当前判定。
- *
- * 单独写成函数是因为 TypeScript 会在函数内把变量收窄，
- * 而这里等 await 之后别的函数可能已经改过它了。
- */
-function isFetchPathUnusable(): boolean {
-  return fetchPathState === 'unusable';
-}
+let fastPathState: 'unknown' | 'usable' | 'unusable' = 'unknown';
 
 /** 一次抓取的结果 */
 type FetchVerdict =
@@ -314,40 +337,79 @@ type FetchVerdict =
   | 'broken';
 
 /**
- * 正在进行的探测。
+ * 正在进行的自证（并发时只做一次）。
  *
- * 主页批量是**并发**解析的：三条笔记会同时开抓。
- * 如果只靠一个布尔标记，三条会各自抓一次 ——
- * 「只多花一次请求」的保证就没了，等于把站点压力翻倍。
- * 所以第一条在抓的时候，后面的等它的结论：
- *   - 结论是「这条路坏了」 → 后面直接放弃，一次请求都不多打
- *   - 结论是「这条路行」  → 后面各自去抓自己那条（每条笔记的 HTML 都不一样）
+ * 主页批量是并发解析的：四条笔记会同时进来。
+ * 如果每条都去自证，就是四次抓取 —— 白打一倍请求，还跟彼此抢连接池。
  */
-let fetchProbe: Promise<{ note: RawNote | null; verdict: FetchVerdict }> | null = null;
+let validating: Promise<void> | null = null;
 
 /**
- * 抓笔记页的 HTML，从里面解析出笔记详情。
+ * 让快路自证一次：同一条笔记，两条路都跑一遍，把**媒体地址逐条比对**。
+ *
+ * - 完全一致 → SSR 里那份和页面渲染那份是同一份东西，之后允许快路接手
+ *   （几百条笔记就不用开几百个 iframe）
+ * - 不一致 → 整场都用页面的结果。宁可慢，也不能下到不一样的东西
+ *   （清晰度、地址时效都可能不一样）
+ *
+ * **只拿带视频的笔记去自证**：视频直链是最容易出差别的地方
+ * （页面用的是 backup 地址，SSR 里可能只有 master 地址）。
+ * 拿一条纯图片笔记去自证，证明不了视频那条路也靠谱。
+ *
+ * 不阻塞当前这条笔记：自证是后台跑的，结果只影响后面的笔记。
  */
-async function loadNoteViaFetch(
+function startValidation(
   noteId: string,
-  xsecToken?: string,
-): Promise<{ note: RawNote | null; verdict: FetchVerdict }> {
-  // 已经判定这条路不行了 → 一次请求都不多打
-  if (isFetchPathUnusable()) return { note: null, verdict: 'broken' };
+  xsecToken: string | undefined,
+  frameNote: RawNote,
+): Promise<void> {
+  // 已经有人在自证了 → 等它的结论，别再打一次请求
+  if (validating) return validating;
+  // 已经有结论了 → 不用再自证
+  if (fastPathState !== 'unknown') return Promise.resolve();
 
-  // 已经有人在探路了 → 等它的结论，别再打一次请求
-  if (fetchProbe) {
-    await fetchProbe.catch(() => undefined);
-    if (isFetchPathUnusable()) return { note: null, verdict: 'broken' };
-    return await fetchNotePage(noteId, xsecToken);
-  }
+  const run = (async () => {
+    try {
+      const viaFetch = await fetchNotePage(noteId, xsecToken);
+      if (!viaFetch?.note) {
+        fastPathState = 'unusable';
+        return;
+      }
+      fastPathState = sameMedia(viaFetch.note, frameNote) ? 'usable' : 'unusable';
+    } catch {
+      fastPathState = 'unusable';
+    }
+  })();
+  validating = run;
+  void run.finally(() => {
+    if (validating === run) validating = null;
+  });
+  return run;
+}
 
-  fetchProbe = fetchNotePage(noteId, xsecToken);
-  try {
-    return await fetchProbe;
-  } finally {
-    fetchProbe = null;
+/**
+ * 两份笔记的媒体是不是同一批东西。
+ *
+ * 比的是**最终会拿去下载的那个地址**（视频优先用 backup 地址），
+ * 而不是原始结构 —— 结构一样但地址不同，一样是下到了不同的地方。
+ *
+ * 大小只在两边都有的时候才比：SSR 里可能压根没写大小，
+ * 那不是「不一样」，只是「少一个字段」。
+ */
+function sameMedia(a: RawNote, b: RawNote): boolean {
+  if (a.videos.length !== b.videos.length) return false;
+  if (a.images.length !== b.images.length) return false;
+  const videoKey = (v: RawNote['videos'][number]) => v.backupUrls[0] ?? v.url;
+  for (let i = 0; i < a.videos.length; i += 1) {
+    if (videoKey(a.videos[i]!) !== videoKey(b.videos[i]!)) return false;
+    const sizeA = a.videos[i]!.size;
+    const sizeB = b.videos[i]!.size;
+    if (sizeA !== undefined && sizeB !== undefined && sizeA !== sizeB) return false;
   }
+  for (let i = 0; i < a.images.length; i += 1) {
+    if (a.images[i]!.url !== b.images[i]!.url) return false;
+  }
+  return true;
 }
 
 /** 真的去抓一次笔记页的 HTML */
@@ -402,11 +464,13 @@ async function fetchNotePage(
 /**
  * 用隐藏 iframe 加载笔记页，读取它的 __INITIAL_STATE__。
  *
- * **必须等到笔记里真的有媒体才算数。**
+ * **媒体是后补的，所以要给它一点时间。**
  * 页面的状态是一点点填进来的：一开始只有 id、标题这些，
  * 视频直链是后面 XHR 回来才补上的。
- * 早返回一步就会拿到一个「有 id 没视频」的空壳 ——
- * 界面上表现为「解析成功了，但一个视频都没有」，而且不会重试、不会报错。
+ * 笔记一出现就先记下来，最多再等 4 秒让媒体补齐；
+ * 补上了就用带媒体的这份，补不上也把笔记返回 ——
+ * 判成「解析失败」是不诚实的（这条笔记确实解析出来了，只是它没有可下载的资源），
+ * 但也不能干等十几秒：几百条笔记那样等下去就没完了。
  *
  * deadline 是整条链路的截止时间（抓 HTML 可能已经花掉几秒），
  * 不能在这里又从头给一份完整预算。
@@ -425,8 +489,9 @@ async function loadNoteViaFrame(
 
   try {
     // 笔记页是 SSR 的，状态内联在 HTML 里，实测 370ms 就能读到。
-    // 但媒体是后补的，所以要给足时间。
     const end = Math.min(deadline, Date.now() + FRAME_WAIT_MS);
+    let shell: RawNote | null = null;
+    let shellAt = 0;
     while (Date.now() < end) {
       await new Promise((r) => setTimeout(r, 80));
       let state: any = null;
@@ -438,11 +503,19 @@ async function loadNoteViaFrame(
       if (!state) continue;
       const note = extractNoteFromState(state, noteId);
       if (!note) continue;
-      // 空壳不算 —— 继续等媒体补上
-      if (!hasMedia(note)) continue;
-      return note;
+      // 有媒体 —— 直接用
+      if (hasMedia(note)) return note;
+      // 空壳 —— 记下来，等媒体补齐
+      if (!shell) {
+        shell = note;
+        shellAt = Date.now();
+      } else if (Date.now() - shellAt > FRAME_MEDIA_WAIT_MS) {
+        // 等够了还是没有媒体 —— 这条笔记就是没有可下载的资源
+        return shell;
+      }
     }
-    return null;
+    // 状态一直没出现：算失败
+    return shell;
   } finally {
     frame.remove();
   }

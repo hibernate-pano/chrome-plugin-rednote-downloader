@@ -18,7 +18,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
 
-import { notePageHtml, serializeState, UNDEF } from './fake-site.mjs';
+import { makeRequestCounter, notePageHtml, serializeState, UNDEF } from './fake-site.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -227,8 +227,19 @@ async function main() {
 
   const port = 9700 + (process.pid % 90);
   const origin = `https://127.0.0.1:${port}`;
+  const { counter, record } = makeRequestCounter();
+  // 打包引擎自己也会 fetch 媒体（跨域取字节），那些不算「解析用的抓取」——
+  // 只数笔记页的抓取。
+  let notePageFetches = 0;
   const server = https.createServer(cert, (req, res) => {
+    record(req);
     const url = new URL(req.url, 'http://127.0.0.1');
+    if (
+      String(req.headers['sec-fetch-dest'] || '') === 'empty' &&
+      url.pathname.startsWith('/explore/')
+    ) {
+      notePageFetches += 1;
+    }
     // 扩展在后台页面里跨域取媒体，需要 CORS 头
     res.setHeader('access-control-allow-origin', '*');
     res.setHeader('access-control-expose-headers', 'Content-Length');
@@ -544,12 +555,20 @@ async function main() {
   }
 
   /* ---------------------------------------------------------------- */
-  /* 3. 解析笔记时没开隐藏 iframe（走的是抓 HTML 的快路）              */
+  /* 3. 解析走的是隐藏 iframe（1.0.0 的主路），抓 HTML 只用来自证一次   */
   /* ---------------------------------------------------------------- */
-  const iframes = await cdp.eval(
-    `document.querySelectorAll('iframe').length`,
+  // 注意：隐藏 iframe 用完就删了，在页面里数 iframe 看不到 ——
+  // 要数得在假站点那边数（Sec-Fetch-Dest: iframe = 页面导航，empty = 脚本抓取）。
+  check(
+    '解析主路是隐藏 iframe（每条笔记一个页面导航）',
+    counter.iframe === NOTES.length,
+    `iframe ${counter.iframe} 个 / 抓取 ${counter.fetch} 次`,
   );
-  check('解析笔记时没有开隐藏 iframe', Number(iframes) === 0, `iframe=${iframes}`);
+  check(
+    '抓 HTML 只用来自证一次，不是每条笔记都白打一遍',
+    notePageFetches <= 1,
+    `抓笔记页 ${notePageFetches} 次（笔记 ${NOTES.length} 条）`,
+  );
 
   /* ---------------------------------------------------------------- */
   /* 4. 面板显示的是打包完成，而不是「保存到某个文件夹」               */

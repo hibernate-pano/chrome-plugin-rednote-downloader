@@ -49,6 +49,13 @@ const IMAGE_PREVIEW =
 const VIDEO_URL =
   'https://sns-bak-v1.xhscdn.com/stream/79/110/258/01eab1a3bcc06cc24f037001a0c5e9440a_258.mp4';
 
+/**
+ * 一条「坏」的视频直链（本地假站点上的 404）。
+ *
+ * 用来模拟「SSR 里那份直链是坏的 / 跟页面看到的不一样」。
+ */
+let BROKEN_VIDEO_URL = '';
+
 const AUTHOR = 'mockauthor';
 
 const NOTES = [
@@ -171,9 +178,29 @@ function profileHtml() {
  *   false —— 没有（真站点未登录时就是这样：详情是页面 JS 用 XHR 拉的）。
  *            扩展必须退回 iframe，而且**只能多花一次抓取**，
  *            不能给每条笔记都白打一遍。
+ *
+ * mediaOverride 用来改写详情里的媒体直链 ——
+ * 模拟「SSR 里那份跟页面渲染那份不是同一个东西」（真站点上完全可能：
+ * SSR 少几个字段、地址是旧的、直链是坏的）。
  */
-function noteHtml(note, ssrDetail = true) {
-  return notePageHtml({ note, detail: noteDetail(note), ssrDetail });
+function noteHtml(note, ssrDetail = true, mediaOverride = null) {
+  const detail = noteDetail(note);
+  if (mediaOverride) mediaOverride(detail);
+  return notePageHtml({ note, detail, ssrDetail });
+}
+
+/**
+ * 把详情里的视频直链换成一条坏地址。
+ *
+ * 用来验证扩展的判断对不对：
+ * 页面渲染出来的那条直链是好的，SSR 里那条是坏的 ——
+ * 扩展必须下页面那份（好），不能下 SSR 那份（坏）。
+ */
+function breakVideoUrl(detail) {
+  const h264 = detail.video?.media?.stream?.h264;
+  if (!Array.isArray(h264) || h264.length === 0) return;
+  h264[0].masterUrl = BROKEN_VIDEO_URL;
+  h264[0].backupUrls = [BROKEN_VIDEO_URL];
 }
 
 /* ------------------------------------------------------------------ */
@@ -282,22 +309,64 @@ async function useBrowserEngine(targets, testDist) {
     `chrome.storage.local.set({'rednote.settings': {downloadMode: 'browser'}}).then(() => 'ok')`,
   );
   console.log('▶ 已切到「浏览器下载」模式');
+  return sw;
 }
 
 function downloadRoot() {
-  return path.join(process.env.HOME || '', 'Downloads', '小红书下载');
+  // 测试专用目录，不写用户的 ~/Downloads ——
+  // 一是别去动用户自己的文件夹，二是 macOS 会拦着终端进程读 ~/Downloads
+  // （「Operation not permitted」），那样测试根本数不到落盘的文件。
+  return path.join(profileDir, 'downloads', '小红书下载');
+}
+
+/**
+ * 把 Chrome 的下载目录指到测试目录。
+ *
+ * 没有这一步，文件会落到用户自己的 ~/Downloads 里 ——
+ * 测试既污染用户环境，又因为系统权限读不到文件
+ * （macOS 会拦着终端进程读 ~/Downloads，报「Operation not permitted」）。
+ *
+ * 用的是**用户配置**（Preferences）而不是 CDP 的 setDownloadBehavior：
+ * 后者会让 Chrome 忽略每个下载项自己的相对路径，
+ * 文件全平铺在目录里 —— 那就测不到「按笔记/按作者/全部平铺」了。
+ */
+function prepareDownloadDir() {
+  const dir = path.join(profileDir, 'downloads');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(path.join(profileDir, 'Default'), { recursive: true });
+  const prefsPath = path.join(profileDir, 'Default', 'Preferences');
+  const prefs = fs.existsSync(prefsPath)
+    ? JSON.parse(fs.readFileSync(prefsPath, 'utf8') || '{}')
+    : {};
+  prefs.download = {
+    ...(prefs.download || {}),
+    default_directory: dir,
+    prompt_for_download: false,
+    directory_upgrade: true,
+  };
+  prefs.savefile = { ...(prefs.savefile || {}), default_directory: dir };
+  fs.writeFileSync(prefsPath, JSON.stringify(prefs));
+  return dir;
 }
 
 async function main() {
   // 「服务端渲染的 HTML 里有没有笔记详情」—— 真站点未登录时是没有的，
   // 详情是页面 JS 用 XHR 拉的。两种都要测。
   let ssrDetail = true;
+  // 「SSR 里的直链跟页面渲染出来的不一样」—— 用来验证扩展是不是下到了页面看到的那一份。
+  let ssrMediaDiffers = false;
   const { counter, record } = makeRequestCounter();
 
   const server = createServer((req, res) => {
     record(req);
     const url = new URL(req.url, 'http://127.0.0.1');
     res.setHeader('content-type', 'text/html; charset=utf-8');
+    if (url.pathname.startsWith('/media/')) {
+      // 坏直链：故意 404 —— 下它就等于下不到东西
+      res.statusCode = 404;
+      res.end('not found');
+      return;
+    }
     if (url.pathname.startsWith('/user/profile/')) {
       res.end(profileHtml());
       return;
@@ -306,7 +375,12 @@ async function main() {
     if (explore) {
       const note = NOTES.find((n) => n.id === explore[1]);
       if (note) {
-        res.end(noteHtml(note, ssrDetail));
+        // 抓 HTML（Sec-Fetch-Dest: empty）和页面导航（iframe）给不同的内容：
+        // 导航给「页面渲染的那份」，抓取给「SSR 那份」。
+        const isFetch = String(req.headers['sec-fetch-dest'] || '') === 'empty';
+        res.end(
+          noteHtml(note, ssrDetail, isFetch && ssrMediaDiffers ? breakVideoUrl : null),
+        );
         return;
       }
     }
@@ -323,8 +397,11 @@ async function main() {
   const manifestPath = path.join(testDist, 'manifest.json');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   const origin = `http://127.0.0.1:${port}`;
+  BROKEN_VIDEO_URL = `${origin}/media/broken-video.mp4`;
   for (const cs of manifest.content_scripts) cs.matches.push(`${origin}/*`);
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+  prepareDownloadDir();
 
   const chrome = spawn(
     resolveChrome(),
@@ -592,6 +669,7 @@ async function main() {
     }
     check('解析过程有可见进度', Boolean(resolvingUi?.resolving), JSON.stringify(resolvingUi));
 
+
     // 等下载落盘。
     // 注意：Chrome 下一个正在下载的文件会先落成 xxx.crdownload，
     // 那不算下完 —— 数文件的时候必须把它排除，否则会在视频还没下完时就「达标」
@@ -607,6 +685,7 @@ async function main() {
       }
     }
     const fresh = after.filter((f) => !before.includes(f));
+
 
     check('批量文件全部落盘', settled && fresh.length === 4, `新增 ${fresh.length} 个：${fresh.map((f) => path.relative(downloadRoot(), f)).join(', ')}`);
 
@@ -624,18 +703,20 @@ async function main() {
     const extensionErrors = logs.filter((l) => l.kind === 'error' || l.kind === 'exception');
     check('扩展无运行时报错', extensionErrors.length === 0, extensionErrors.slice(0, 3).map((e) => e.text.slice(0, 200)).join(' | '));
 
-    // 解析走的是哪条路 —— 这一条直接决定几百条笔记时机器会不会卡
-    // 抓 HTML（快路）：每条笔记一次 fetch，不开 iframe
-    // 隐藏 iframe（兜底）：每条笔记一个真实页面导航
+    // 解析走的是哪条路 —— 这一条直接决定几百条笔记时机器会不会卡，
+    // 也决定下到的是不是「用户眼睛看到的那份」。
+    // 隐藏 iframe：读页面渲染后的状态（1.0.0 就是这么干的，最权威）
+    // 抓 HTML：读服务端渲染出来的那份 —— 只有跟页面那份逐条比对过完全一致才准接手
     check(
-      '解析走的是「抓 HTML」快路：只有媒体拿不到的那条才退回 iframe',
-      counter.iframe === 1,
-      `抓取 ${counter.fetch} 次 / iframe ${counter.iframe} 个（4 条笔记里 1 条媒体拿不到）`,
+      '主路是隐藏 iframe（跟 1.0.0 一样）：4 条笔记各开一个页面',
+      counter.iframe === 4,
+      `iframe ${counter.iframe} 个 / 抓取 ${counter.fetch} 次`,
     );
     check(
-      '快路对每条笔记各抓一次，没有多抓',
-      counter.fetch === 4,
-      `抓取 ${counter.fetch} 次（笔记 4 条）`,
+      '快路只自证一次，不是给每条笔记都白打一遍',
+      counter.fetch <= 2,
+      `抓取 ${counter.fetch} 次（4 条笔记：1 次自证 + 空壳那条的兜底）—— ` +
+        '每条都白打一遍会把站点压力翻倍，还会跟 iframe 抢连接池，把解析成功率拖下去',
     );
 
     // 媒体拿不到的那条笔记必须**看得见地失败**，不能是「解析成功但一个视频都没有」
@@ -653,8 +734,8 @@ async function main() {
     `);
     const shell = JSON.parse(shellCard);
     check(
-      '媒体拿不到的笔记标成「解析失败」（不静默成功）',
-      shell.found && /解析失败/.test(shell.meta),
+      '没拿到资源的笔记标成「未取到资源」（不静默成功，也不谎报解析失败）',
+      shell.found && /未取到资源/.test(shell.meta),
       `卡片状态：${shell.meta || shell.text}`,
     );
 
@@ -980,13 +1061,100 @@ async function main() {
       `iframe ${counter.iframe} 个 / 抓取 ${counter.fetch} 次`,
     );
     check(
-      '快路不可用时只多花一次抓取，不是每条笔记都白打一遍',
-      counter.fetch === 1,
-      `抓取 ${counter.fetch} 次（笔记 3 条）—— 每条都白抓一次的话会把站点压力翻倍，` +
+      '快路不可用时只多花一两次抓取，不是每条笔记都白打一遍',
+      counter.fetch <= 2,
+      `抓取 ${counter.fetch} 次（笔记 4 条）—— 每条都白抓一次的话会把站点压力翻倍，` +
         '还会跟 iframe 抢连接池，把解析成功率拖下去',
     );
 
     for (const f of noSsrFresh) {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 第五轮：SSR 里的直链跟页面看到的不一样                               */
+    /* ------------------------------------------------------------------ */
+
+    console.log('\n▶ 换成「SSR 直链是坏的」的站点，再下载一次…');
+    ssrDetail = true;
+    ssrMediaDiffers = true;
+    counter.fetch = 0;
+    counter.iframe = 0;
+    counter.other = 0;
+
+    // 重新加载页面 = 新的 content script 实例（路径判定从头开始）
+    await cdp.send('Page.navigate', {
+      url: `${origin}/user/profile/mockuser0001?xsec_token=mock`,
+    });
+    await sleep(2000);
+    for (let i = 0; i < 40; i += 1) {
+      const ok = await evaluate(
+        `!!document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-fab')`,
+      );
+      if (ok) break;
+      await sleep(400);
+    }
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        sr.querySelector('.rn-fab').click();
+        return true;
+      })()
+    `);
+
+    for (let i = 0; i < 40; i += 1) {
+      await sleep(400);
+      const n = await evaluate(
+        `document.querySelector('rednote-root').shadowRoot.querySelectorAll('.rn-card').length`,
+      );
+      if (n >= 3) break;
+    }
+
+    const beforeDiff = walk(downloadRoot());
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        const all = [...sr.querySelectorAll('.rn-toolbar-right .rn-btn')].find(b => /全选/.test(b.textContent));
+        if (all) all.click();
+        const start = sr.querySelector('.rn-footer .rn-btn[data-variant="primary"]');
+        if (start) start.click();
+        return true;
+      })()
+    `);
+
+    let diffFresh = [];
+    for (let i = 0; i < 60; i += 1) {
+      await sleep(700);
+      diffFresh = walk(downloadRoot()).filter(
+        (f) => !beforeDiff.includes(f) && !f.endsWith('.crdownload'),
+      );
+      if (diffFresh.length >= 4) break;
+    }
+
+    // 关键：视频必须下到**页面渲染的那份**（好的那条直链），
+    // 而不是 SSR 里那条（坏的，404）。
+    const diffVideo = diffFresh.find((f) => f.endsWith('.mp4'));
+    check(
+      'SSR 直链跟页面不一样时，下的是页面那份（不是 SSR 那份坏地址）',
+      Boolean(diffVideo) && fs.statSync(diffVideo).size > 1024,
+      diffVideo ? `${path.basename(diffVideo)}=${fs.statSync(diffVideo).size}B` : '没下到视频',
+    );
+    check(
+      '图片也照样下到了',
+      diffFresh.filter((f) => /\.(jpg|jpeg|png|webp)$/i.test(f)).length === 3,
+      diffFresh.map((f) => path.basename(f)).join(', '),
+    );
+    check(
+      '发现直链对不上就整场退回页面渲染（不再用 SSR 那份）',
+      counter.iframe === 4,
+      `iframe ${counter.iframe} 个 / 抓取 ${counter.fetch} 次`,
+    );
+
+    for (const f of diffFresh) {
       try {
         fs.rmSync(f, { force: true });
       } catch {

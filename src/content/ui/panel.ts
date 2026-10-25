@@ -61,6 +61,20 @@ export interface BatchViewModel {
   avatar?: string;
   phase: BatchPhase;
   scanInfo?: { found: number; rounds: number };
+  /**
+   * 这一批内容是用哪条路解析出来的。
+   *
+   * 'iframe' —— 隐藏 iframe 读页面渲染后的状态（和 1.0.0 一样，最权威）
+   * 'fetch'  —— 抓笔记页的 HTML（更快，但必须先证明与页面渲染结果一致才用）
+   *
+   * 显示出来是有原因的：两条路给的东西**可能不一样**，
+   * 用户一眼就能看出这批是不是按页面看到的样子下的。
+   */
+  parsePath?: 'iframe' | 'fetch';
+  /** 这一场实际用过的路（两条都用过就都记上） */
+  parsePaths?: Array<'iframe' | 'fetch'>;
+  /** 快路是否被证明与页面渲染结果一致（一致了才敢让它接手） */
+  parseTrusted?: boolean;
   cards: BatchCard[];
   /** 笔记类型筛选：只影响卡片列表 */
   noteFilter: NoteFilter;
@@ -193,6 +207,28 @@ interface BatchCardRefs {
 
 const RING_R = 11;
 const RING_C = 2 * Math.PI * RING_R;
+
+/**
+ * 这一批内容是怎么解析出来的，写成一行小字。
+ *
+ * 「页面渲染」= 隐藏 iframe 读页面渲染后的状态（1.0.0 就是这么干的，最权威）
+ * 「快路」    = 抓笔记页的 HTML —— 只有在跟页面渲染的结果**逐条比对过完全一致**
+ *              之后才敢用它（否则宁可慢，也不能下到不一样的东西）
+ * 「兜底抓取」= 页面没给出资源时临时抓一次 HTML 救场，没有可比对的基准
+ */
+function describeParsePaths(
+  paths: Array<'iframe' | 'fetch'>,
+  trusted?: boolean,
+): string {
+  const frame = paths.includes('iframe');
+  const fast = paths.includes('fetch');
+  if (frame && fast) {
+    return trusted ? ' · 页面渲染 + 快路（已核对与页面一致）' : ' · 页面渲染 + 兜底抓取';
+  }
+  if (fast) return trusted ? ' · 快路（已核对与页面一致）' : ' · 兜底抓取';
+  if (frame) return ' · 页面渲染';
+  return '';
+}
 
 /** 进度环的缺口：百分比越满，缺口越小 */
 function ringOffset(pct: number): number {
@@ -1219,6 +1255,10 @@ export class Panel {
       refs.meta.innerHTML = `<span class="rn-resolving">${icon('spinner', 11)}解析中…</span>`;
     } else if (card.failed) {
       refs.meta.innerHTML = '<span class="rn-err">解析失败</span>';
+    } else if (card.resolved && card.mediaCount === 0) {
+      // 解析出来了，但一个资源都没拿到（只有文字，或者媒体一直没补上）。
+      // 这跟「解析失败」是两回事 —— 不能混为一谈，也不能装作没事。
+      refs.meta.textContent = '未取到资源';
     } else if (card.likedCount) {
       refs.meta.textContent = `${card.likedCount} 赞`;
     } else {
@@ -1346,7 +1386,11 @@ export class Panel {
       const r = vm.resolveInfo;
       sub.textContent = `正在解析 ${r.done}/${r.total} 条笔记${r.failed ? `（${r.failed} 条失败）` : ''}`;
     } else {
-      sub.textContent = `已扫描 ${vm.cards.length} 条笔记（视频 ${videoCount} / 图集 ${imageCount}）`;
+      // 解析走的是哪条路，写出来 —— 两条路给的东西可能不一样，
+      // 用户一眼就能看出这批内容是不是按页面看到的样子下的。
+      const paths = vm.parsePaths ?? (vm.parsePath ? [vm.parsePath] : []);
+      const pathLabel = describeParsePaths(paths, vm.parseTrusted);
+      sub.textContent = `已扫描 ${vm.cards.length} 条笔记（视频 ${videoCount} / 图集 ${imageCount}）${pathLabel}`;
     }
   }
 
