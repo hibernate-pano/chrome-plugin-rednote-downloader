@@ -587,9 +587,12 @@ button { font-family: inherit; }
   box-shadow: var(--sh-card-hov);
   display: grid; place-items: center;
   opacity: 0; transform: scale(.85);
+  /* 隐藏时也要 visibility:hidden —— 只用 opacity:0 的话，
+     它还留在 Tab 键顺序里，键盘用户会 Tab 到一个看不见的按钮上。 */
+  visibility: hidden;
   transition: opacity .15s ease, transform .15s ease, background .12s ease, color .12s ease;
 }
-.rn-hover-btn[data-show="true"] { opacity: 1; transform: none; }
+.rn-hover-btn[data-show="true"] { opacity: 1; transform: none; visibility: visible; }
 .rn-hover-btn:hover { background: var(--brand); color: #fff; }
 .rn-hover-btn svg { width: 15px; height: 15px; }
 

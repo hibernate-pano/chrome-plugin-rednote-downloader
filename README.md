@@ -140,13 +140,20 @@ pnpm build      # 打包到 dist/
 pnpm watch      # 监听改动自动打包
 pnpm typecheck  # TypeScript 检查
 pnpm test       # 单元测试（93 个用例）
-pnpm e2e        # 端到端测试（真实 Chrome：笔记页 1 项 + 主页批量 44 项 + 打包 17 项）
+pnpm e2e        # 端到端测试（真实 Chrome：笔记页 2 项 + 主页批量 44 项 + 打包 17 项）
+node scripts/store-assets.mjs   # 生成商店素材（两张 1280×800 截图 + 440×280 宣传图）
 ```
 
-> 笔记页那一项只跑得起来 1 条断言：游客态访问真站点的笔记页会被重定向到
-> `/login`（错误码 300015 / 300031），其余断言要登录才有意义。
+> 笔记页那一项只有 2 条断言跑得起来（都在登录墙检查之前）：
+> 游客态访问真站点的笔记页会被重定向到 `/login`（错误码 300015 / 300031），
+> 其余断言要登录才有意义。
 > 主页批量和打包那两套跑的是**假站点**（`scripts/fake-site.mjs`），
 > 假站点必须比真站点更「脏」，不然测试全绿、线上照样坏。
+
+> 商店上架要填的东西（名称、简介、详细说明、权限理由、素材清单）都写在
+> [`docs/store-listing.md`](docs/store-listing.md)，隐私政策在
+> [`docs/privacy.md`](docs/privacy.md)。素材图由 `scripts/store-assets.mjs` 生成，
+> 不要手改图 —— 界面改了就重新生成。
 
 > 脚本里不写死包管理器（用的是 `node build.mjs` 而不是 `npm run build`），
 > 所以 `npm run build` / `yarn build` 也能跑，只是别再用 npm 装依赖 ——
@@ -290,6 +297,19 @@ tests/
     排查时用浏览器实测过：**父页面发的消息，子窗口是收得到的**（只是被守卫挡掉）——
     这一点能区分「消息没送到」和「送到了但被拒」。
     现在改成：自己 + 父窗口都认。**通道号才是身份凭证**，跨站页面伪造不出请求。
+
+17. **样式在 shadow root 里，元素却挂在页面 DOM 上 —— 样式一条都不生效。**
+    主页卡片 hover 时浮出的快捷下载按钮，原来 append 到 `document.documentElement`
+    （页面自己的 DOM），而整份样式表在 `rednote-root` 的 shadow root 里。
+    shadow root 的规则**匹配不到页面里的元素** ⇒ `position: fixed` 没生效、
+    `opacity: 0` 没生效 ⇒ 每页左上角都挂着一个 31×24 的灰按钮，从 v1.0.0 挂到 v1.3.1。
+    2026-10-25 出商店截图时才发现（截图里那个多出来的小方块）。
+    教训有两条：
+    - **扩展的 UI 一律放进 shadow root**，别往页面 DOM 里塞；
+    - 藏在页面上的 UI 不会被自己的测试发现 —— 测试只断言「该在的在那儿」，
+      没断言「不该在的不在」。现在 e2e 里加了一条：页面 DOM 里不许出现扩展的元素。
+    顺带：`opacity: 0` 隐藏的按钮还留在 Tab 键顺序里，键盘用户会 Tab 到一个看不见的按钮上
+    —— 要隐藏就一起 `visibility: hidden`。
 
 ### 下载方式：浏览器下载 vs 打包成 zip
 

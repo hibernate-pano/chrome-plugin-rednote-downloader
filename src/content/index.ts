@@ -738,7 +738,17 @@ class App {
     });
   }
 
-  /** 主页卡片 hover 时浮出的快捷下载按钮 */
+  /**
+   * 主页卡片 hover 时浮出的快捷下载按钮。
+   *
+   * **它必须待在面板的 shadow root 里**：
+   * 之前挂在 `document.documentElement`（页面自己的 DOM），
+   * 而样式表在 shadow root 里 —— 页面里的元素匹配不到 shadow root 的规则，
+   * 于是 `position: fixed` 和 `opacity: 0` 全都没生效，
+   * 变成一个 31×24 的灰按钮**明晃晃挂在每页左上角**
+   * （2026-10-25 出商店截图时才发现）。
+   * 挂进 shadow root 后样式正常，`destroy()` 时也顺带被一起清掉。
+   */
   private installHoverButton(): void {
     const button = document.createElement('button');
     button.className = 'rn-hover-btn';
@@ -746,7 +756,7 @@ class App {
     button.setAttribute('aria-label', '下载这条笔记的全部内容');
     button.innerHTML = icon('download', 15);
     button.dataset.show = 'false';
-    document.documentElement.appendChild(button);
+    this.panel.shadowRoot.appendChild(button);
 
     let current: HTMLElement | null = null;
 

@@ -271,6 +271,29 @@ async function main() {
   const title = await evaluate('document.title');
   check('笔记页加载', !!title && !title.includes('不见了'), `title=${title}`);
 
+  /* 扩展的 UI 只能待在 shadow root 里。
+     hover 快捷下载按钮以前挂在 document.documentElement（页面自己的 DOM），
+     而样式表在 shadow root 里 —— 页面元素匹配不到 shadow root 的规则，
+     position:fixed 和 opacity:0 全都没生效，
+     结果每页左上角都挂着一个明晃晃的灰按钮（出商店截图时才发现）。
+     这条断言盯的就是「别再把 UI 漏到页面里」。 */
+  const strayUi = await evaluate(`(() => {
+    const sr = document.querySelector('rednote-root')?.shadowRoot;
+    const inPage = document.querySelector('.rn-hover-btn');
+    const inShadow = sr?.querySelector('.rn-hover-btn');
+    return {
+      inPage: !!inPage,
+      inShadow: !!inShadow,
+      opacity: inShadow ? getComputedStyle(inShadow).opacity : null,
+      position: inShadow ? getComputedStyle(inShadow).position : null,
+    };
+  })()`);
+  check(
+    '扩展 UI 不漏到页面 DOM 里',
+    !strayUi.inPage && strayUi.inShadow && strayUi.opacity === '0' && strayUi.position === 'fixed',
+    JSON.stringify(strayUi),
+  );
+
   // 笔记页被重定向到登录墙 —— 这是站点策略变了或者链接的 token 过期了，
   // 不是扩展的毛病。直接说清楚，别让后面一堆看不懂的失败误导人。
   const path = await evaluate('location.pathname');
