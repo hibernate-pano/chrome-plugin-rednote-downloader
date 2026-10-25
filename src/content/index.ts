@@ -464,12 +464,12 @@ class App {
     this.batch.resolving = false;
 
     // 告诉界面这批内容是用哪条路解析出来的 ——
-    // 两条路给的东西可能不一样（清晰度、地址时效），
+    // 几条路给的东西可能不一样（清晰度、地址时效），
     // 显示出来用户才能一眼看出这批是不是按页面看到的样子下的。
     try {
       const path = await this.bridge.call<{
-        path?: 'iframe' | 'fetch';
-        paths?: Array<'iframe' | 'fetch'>;
+        path?: 'iframe' | 'fetch' | 'api';
+        paths?: Array<'iframe' | 'fetch' | 'api'>;
         fastPathTrusted?: boolean;
       }>('api.parsePath');
       if (path?.path) this.batch.parsePath = path.path;

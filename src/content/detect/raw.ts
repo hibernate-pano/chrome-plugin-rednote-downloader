@@ -238,15 +238,18 @@ function collectStreamEntries(stream: any): StreamEntry[] {
 }
 
 function extractVideos(raw: any): RawVideo[] {
-  const video = isObj(raw?.video) ? raw.video : undefined;
+  // 视频信息正常挂在 raw.video 下；但站点改版时也见过直接挂在 raw.media 上的，
+  // 两个都试一遍 —— 少一条路就意味着「视频一条都解析不出来」。
+  const video = isObj(raw?.video) ? raw.video : isObj(raw?.media) ? raw.media : undefined;
   if (!video) return [];
 
   const media = isObj(video.media) ? video.media : {};
   let entries = collectStreamEntries(media.stream);
+  if (entries.length === 0) entries = collectStreamEntries(video.stream);
 
   // mediaV2 是一段 JSON 字符串，结构类似，作为兜底
   if (entries.length === 0) {
-    const mediaV2 = str(video.mediaV2);
+    const mediaV2 = str(video.mediaV2) || str(raw?.mediaV2);
     if (mediaV2) {
       try {
         const parsed = JSON.parse(mediaV2);
@@ -362,6 +365,111 @@ export function titleFromDesc(desc: unknown): string {
  */
 export function hasMedia(note: RawNote): boolean {
   return note.videos.length > 0 || note.images.length > 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 在任意数据里找一条笔记                                              */
+/* ------------------------------------------------------------------ */
+
+/** 深搜时最多看多少个节点（小红书的状态很大，无上限会把主线程占住） */
+const DEEP_SEARCH_BUDGET = 12000;
+/** 深搜的最大深度 */
+const DEEP_SEARCH_DEPTH = 12;
+
+/**
+ * 在任意一份数据里找出「某条笔记」，找不到返回 null。
+ *
+ * **为什么要深搜**：
+ * 小红书把笔记详情放在数据的哪个位置，隔一阵就会变
+ * （实测见过 `note.noteDetailMap[id].note`、`note.noteList`…）。
+ * 已知路径一旦失手，结果就是「整条笔记解析不出来」——
+ * 页面上视频明明在，扩展却一条都拿不到（用户看到的就是「彻底解析不了」）。
+ *
+ * 所以已知路径取不到时，把整份数据翻一遍：
+ * 找到「id 对得上、并且带媒体」的那个对象，就用它。
+ *
+ * **只认 id 对得上的**：拿错笔记 = 下错内容，比失败糟糕得多。
+ *
+ * @param payload 任意数据（页面状态、接口响应……）
+ * @param noteId  要找的笔记 id；不给就是「哪条都行」（有媒体的那条）
+ */
+export function findNoteInPayload(payload: unknown, noteId?: string): RawNote | null {
+  if (!isObj(payload)) return null;
+
+  // 已知路径先试（快，而且能保证拿到的是「这一条」）
+  const known = extractNoteFromState(payload, noteId);
+  if (known && hasMedia(known)) return known;
+
+  // 深搜兜底
+  let budget = DEEP_SEARCH_BUDGET;
+  const seen = new WeakSet<object>();
+
+  const visit = (
+    node: unknown,
+    depth: number,
+    key: string,
+    parentId: string,
+  ): RawNote | null => {
+    if (budget <= 0) return null;
+    if (node === null || typeof node !== 'object') return null;
+    if (depth > DEEP_SEARCH_DEPTH) return null;
+    if (seen.has(node)) return null;
+    seen.add(node);
+    budget -= 1;
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = visit(child, depth + 1, key, parentId);
+        if (hit) return hit;
+      }
+      return null;
+    }
+
+    if (!isObj(node)) return null;
+
+    const hit = matchNote(node, noteId, key, parentId);
+    if (hit) return hit;
+
+    // 自己身上没有 id 的话，把外层的 id 传下去 ——
+    // 接口响应里常见的形状是 `{id, note_card: {...}}`，
+    // 媒体在 note_card 里、id 在外层。
+    const myId = str(node.noteId) || str(node.note_id) || str(node.id) || parentId;
+    for (const childKey of Object.keys(node)) {
+      const hit2 = visit(node[childKey], depth + 1, childKey, myId);
+      if (hit2) return hit2;
+    }
+    return null;
+  };
+
+  return visit(payload, 0, '', '');
+}
+
+/**
+ * 一个对象能不能当成「我们那条笔记」。
+ *
+ * 站点把笔记包在各种壳里（`{note: {...}}`、`{note_card: {...}}`…），
+ * 壳里没写 id 的时候用外层的 id 补上 —— 外层那个就是笔记 id
+ * （`noteDetailMap[id].note`、接口响应的 `{id, note_card}` 都是这个形状）。
+ */
+function matchNote(node: any, noteId: string | undefined, key: string, parentId: string): RawNote | null {
+  const candidates: any[] = [node];
+  for (const childKey of ['note', 'noteCard', 'note_card', 'noteInfo', 'detail']) {
+    const child = node[childKey];
+    if (isObj(child)) candidates.push(child);
+  }
+
+  for (const candidate of candidates) {
+    const ownId = str(candidate.noteId) || str(candidate.note_id) || str(candidate.id);
+    const idFallback = ownId || parentId || key;
+    let note = extractNote(candidate);
+    // 壳里没写 id，但外层有 —— 补上再试一次
+    if (!note && idFallback) note = extractNote({ ...candidate, noteId: idFallback });
+    if (!note) continue;
+    if (noteId && note.noteId !== noteId) continue;
+    if (!hasMedia(note)) continue;
+    return note;
+  }
+  return null;
 }
 
 /**

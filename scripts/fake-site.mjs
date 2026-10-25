@@ -34,8 +34,29 @@ export function serializeState(state) {
  *   false —— SSR 的 HTML 里**没有**详情，详情由页面脚本过一会儿补上。
  *            这模拟真站点未登录时的情形：详情是页面 JS 用 XHR 拉的，
  *            服务端渲染的 HTML 里没有（实测 2026-10-24）。
+ * @param detailPath
+ *   详情在状态里的位置。**站点改版时这个位置会变** ——
+ *   'noteDetailMap' 是常见形状，'currentNote' 模拟「换了个地方放」，
+ *   扩展必须照样找得到（不能因为位置变了就一条都解析不出来）。
+ * @param viaApi
+ *   true —— 详情**只**从接口拿（页面自己 XHR 一次），
+ *           而且**不写进 __INITIAL_STATE__**（模拟站点搬进了 store）。
+ *           扩展只能从抓到的接口响应里把笔记找出来。
+ * @param viaApiXhr
+ *   true —— 同上，但用 **XMLHttpRequest + responseType: 'json'** 来拿。
+ *           真站点用 axios，走的就是这条路（实测 2026-10-25：站点打包了 library-axios）。
+ *           特意带上 responseType 是因为：这时读 xhr.responseText **会抛**
+ *           （InvalidStateError），扩展要是只读 responseText，这条路就断了。
  */
-export function notePageHtml({ note, detail, ssrDetail = true, delayMs = 250 }) {
+export function notePageHtml({
+  note,
+  detail,
+  ssrDetail = true,
+  delayMs = 250,
+  detailPath = 'noteDetailMap',
+  viaApi = false,
+  viaApiXhr = false,
+}) {
   const state = {
     note: {
       prevRouteData: {},
@@ -48,7 +69,10 @@ export function notePageHtml({ note, detail, ssrDetail = true, delayMs = 250 }) 
       topCommentId: '',
       highlightDescTexts: [],
       // 真站点这里是空对象（未登录时拿不到详情）
-      noteDetailMap: ssrDetail ? { [note.id]: { note: detail } } : {},
+      noteDetailMap:
+        ssrDetail && !viaApi && !viaApiXhr && detailPath === 'noteDetailMap'
+          ? { [note.id]: { note: detail } }
+          : {},
       serverRequestInfo: { state: 'success', errorCode: 0, errMsg: '' },
       volume: 0,
       recommendVideoMap: {},
@@ -65,21 +89,76 @@ export function notePageHtml({ note, detail, ssrDetail = true, delayMs = 250 }) 
     groupData: { error: null },
   };
 
-  const fill = ssrDetail
-    ? ''
-    : `
+  // 详情被挪到了另一个位置（站点改版）
+  if (ssrDetail && !viaApi && !viaApiXhr && detailPath === 'currentNote') {
+    state.note.currentNote = { note: detail };
+  }
+
+  // 详情只从接口来，而且不写进状态
+  const apiFetch = viaApi
+    ? `
+<script>
+  // 模拟页面自己去接口拿详情（真实站点就是这么干的）
+  fetch('/api/sns/web/v1/feed?note_id=' + encodeURIComponent(${JSON.stringify(note.id)}))
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      window.__rednoteFeedData = data;
+    });
+</script>`
+    : '';
+
+  // 同上，但走 axios 那种 XHR + responseType: 'json' 的路
+  const apiXhr = viaApiXhr
+    ? `
+<script>
+  // 真实站点用 axios：XHR + responseType: 'json'。
+  // 这时 xhr.responseText 读不了（会抛），只有 xhr.response 拿得到。
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/sns/web/v1/feed?note_id=' + encodeURIComponent(${JSON.stringify(note.id)}));
+  xhr.responseType = 'json';
+  xhr.onload = function () { window.__rednoteFeedData = xhr.response; };
+  xhr.send();
+</script>`
+    : '';
+
+  // 「SSR 里没有详情」时，页面脚本过一会儿把详情补进状态
+  const lateFill =
+    !ssrDetail && !viaApi && !viaApiXhr
+      ? `
 <script>
   // 模拟页面自己的 XHR 回来之后把详情补进状态里
   setTimeout(function () {
     window.__INITIAL_STATE__.note.noteDetailMap[${JSON.stringify(note.id)}] =
       { note: ${JSON.stringify(detail)} };
   }, ${delayMs});
-</script>`;
+</script>`
+      : '';
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>${note.title} - 小红书</title>
-<script>window.__INITIAL_STATE__ = ${serializeState(state)};</script>${fill}
+<script>window.__INITIAL_STATE__ = ${serializeState(state)};</script>${lateFill}${apiFetch}${apiXhr}
 </head><body><div id="app"></div></body></html>`;
+}
+
+/**
+ * 笔记详情接口的响应（页面自己 XHR 拿到的那份）。
+ *
+ * 形状按真站点：外层是 `{data: {items: [{id, note_card: {...}}]}}`，
+ * 媒体在 note_card 里、id 在外层。
+ */
+export function feedApiJson(note, detail) {
+  return {
+    success: true,
+    data: {
+      items: [
+        {
+          id: note.id,
+          xsec_token: 'fake-token',
+          note_card: detail,
+        },
+      ],
+    },
+  };
 }
 
 /**

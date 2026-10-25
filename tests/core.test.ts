@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { sanitizeSegment, sanitizeStem, buildSafeFileName, renderTemplate, guessExtension, formatBytes, matchesMediaFilter, filterByMediaFilter, mediaFilterLabel, effectiveTemplate, saveStructureLabel, saveStructureName } from '../src/shared/utils';
-import { originalImageUrl, jpegImageUrl, extractNote, extractNoteFromState, hasMedia, parseInitialState, titleFromDesc } from '../src/content/detect/raw';
+import { originalImageUrl, jpegImageUrl, extractNote, extractNoteFromState, findNoteInPayload, hasMedia, parseInitialState, titleFromDesc } from '../src/content/detect/raw';
 import { buildFileName, buildRelativePath, noteToMediaItems } from '../src/content/detect/media';
 import { DEFAULT_SETTINGS } from '../src/shared/types';
 
@@ -651,4 +651,97 @@ test('hasMedia：有视频或有图片才算有内容', () => {
   );
   assert.ok(withImage);
   assert.equal(hasMedia(withImage), true);
+});
+
+/* ------------------------------------------------------------------ */
+/* 在任意数据里找笔记                                                  */
+/* ------------------------------------------------------------------ */
+
+test('findNoteInPayload：已知位置照常能取到', () => {
+  const note = findNoteInPayload(makeState({ h264: [STREAM_ENTRY] }), '6ab1a4190000000035013fcf');
+  assert.ok(note);
+  assert.equal(note!.videos.length, 1);
+});
+
+test('findNoteInPayload：详情被挪到别处也能找到（站点改版）', () => {
+  // 站点把详情从 noteDetailMap 挪到了 currentNote —— 已知路径失手，深搜兜底
+  const detail = {
+    noteId: '6ab1a4190000000035013fcf',
+    type: 'video',
+    title: '挪了位置的笔记',
+    user: { nickname: 'evelyn' },
+    video: { media: { stream: { h264: [STREAM_ENTRY] } } },
+  };
+  const note = findNoteInPayload(
+    { note: { currentNote: { note: detail } } },
+    '6ab1a4190000000035013fcf',
+  );
+  assert.ok(note, '详情挪了位置也必须找得到');
+  assert.equal(note!.videos.length, 1);
+  assert.equal(note!.title, '挪了位置的笔记');
+});
+
+test('findNoteInPayload：接口响应那种 {id, note_card} 的形状也能取到', () => {
+  const payload = {
+    data: {
+      items: [
+        {
+          id: '6ab1a4190000000035013fcf',
+          xsec_token: 'tok',
+          note_card: {
+            type: 'video',
+            display_title: '接口里的笔记',
+            user: { nickname: 'evelyn' },
+            video: { media: { stream: { h264: [STREAM_ENTRY] } } },
+          },
+        },
+      ],
+    },
+  };
+  const note = findNoteInPayload(payload, '6ab1a4190000000035013fcf');
+  assert.ok(note, '接口响应里的笔记必须找得到');
+  assert.equal(note!.noteId, '6ab1a4190000000035013fcf');
+  assert.equal(note!.videos.length, 1);
+});
+
+test('findNoteInPayload：绝不返回别的笔记（拿错就是下错）', () => {
+  const payload = {
+    data: {
+      items: [
+        {
+          id: 'other-note-id',
+          note_card: {
+            type: 'video',
+            video: { media: { stream: { h264: [STREAM_ENTRY] } } },
+          },
+        },
+      ],
+    },
+  };
+  assert.equal(findNoteInPayload(payload, '6ab1a4190000000035013fcf'), null);
+});
+
+test('findNoteInPayload：没有媒体的笔记不算数', () => {
+  const payload = {
+    note: {
+      noteDetailMap: {
+        '6ab1a4190000000035013fcf': {
+          note: { noteId: '6ab1a4190000000035013fcf', type: 'normal', title: '只有文字' },
+        },
+      },
+    },
+  };
+  assert.equal(findNoteInPayload(payload, '6ab1a4190000000035013fcf'), null);
+});
+
+test('findNoteInPayload：视频挂在 media 上（不是 video）也认', () => {
+  const detail = {
+    noteId: 'v9',
+    type: 'video',
+    title: '换了挂法的笔记',
+    media: { stream: { h264: [STREAM_ENTRY] } },
+  };
+  const note = findNoteInPayload({ note: { currentNote: { note: detail } } }, 'v9');
+  assert.ok(note);
+  assert.equal(note!.videos.length, 1);
 });

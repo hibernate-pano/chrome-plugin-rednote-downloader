@@ -3,7 +3,7 @@ import type { MediaItem, NoteInfo, Settings } from '../../shared/types';
 import { shortId, sleep } from '../../shared/utils';
 import { noteToInfo, noteToMediaItems } from './media';
 import type { RawNote, RawNoteRef } from './raw';
-import { hasMedia, isObj, num, str, unref } from './raw';
+import { hasMedia, findNoteInPayload, isObj, num, str, unref } from './raw';
 
 export type PageKind = 'note' | 'profile' | 'unknown';
 
@@ -61,13 +61,49 @@ export class Detector {
         // 状态是一点点填进来的：一开始只有 id 和标题，媒体是后面才补上的。
         // 拿到空壳就当「还没好」—— 让调用方继续等，
         // 免得面板上出现「识别成功，但一个视频都没有」。
-        if (res.note.videos.length === 0 && res.note.images.length === 0) return null;
+        if (res.note.videos.length === 0 && res.note.images.length === 0) {
+          // 空壳就换一条路：页面自己抓的接口响应里，媒体信息最全。
+          const fromApi = await this.noteFromCaptured(res.note.noteId);
+          if (fromApi) {
+            const apiInfo = noteToInfo(fromApi, settings, location.href);
+            // 说实话：这条是从接口响应来的，不是从状态里来的
+            apiInfo.source = 'api';
+            return apiInfo;
+          }
+          return null;
+        }
         const info = noteToInfo(res.note, settings, location.href);
         info.source = 'initial-state';
         return info;
       }
     } catch {
       /* fallthrough */
+    }
+    return null;
+  }
+
+  /**
+   * 从页面自己抓到的接口响应里找一条笔记。
+   *
+   * 笔记详情是页面用 XHR 拿的（`/api/sns/web/v1/feed`），
+   * 那份响应里的媒体信息最全 —— 直链、清晰度、时长都是原始的。
+   *
+   * **为什么需要它**：站点把详情放在 `__INITIAL_STATE__` 的哪个位置会变，
+   * 位置一变，「从状态里取」就取不到东西了（页面上视频明明在）。
+   * 接口响应是另一个独立的来源，形状变了也不影响它。
+   */
+  private async noteFromCaptured(noteId: string): Promise<RawNote | null> {
+    if (!noteId) return null;
+    try {
+      const captured = await this.deps.bridge.call<Array<{ url: string; body: any }>>('api.captured');
+      const list = Array.isArray(captured) ? captured : [];
+      // 从新到旧找：后抓到的响应更新鲜
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const note = findNoteInPayload(list[i]?.body, noteId);
+        if (note) return note;
+      }
+    } catch {
+      /* ignore */
     }
     return null;
   }
@@ -381,6 +417,16 @@ export class Detector {
       }
     } catch {
       /* ignore */
+    }
+
+    // 1.5) 状态里没有媒体，但页面自己抓的接口响应里有 —— 用那份。
+    //     详情是页面用 XHR 拿的，那份响应最全，也不受「状态结构变了」影响。
+    if (!raw) {
+      const fromApi = await this.noteFromCaptured(ref.noteId);
+      if (fromApi) {
+        raw = fromApi;
+        source = 'api';
+      }
     }
 
     // 2) 否则让页面自己加载这篇笔记

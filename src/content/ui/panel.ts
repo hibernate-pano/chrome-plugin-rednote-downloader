@@ -66,13 +66,14 @@ export interface BatchViewModel {
    *
    * 'iframe' —— 隐藏 iframe 读页面渲染后的状态（和 1.0.0 一样，最权威）
    * 'fetch'  —— 抓笔记页的 HTML（更快，但必须先证明与页面渲染结果一致才用）
+   * 'api'    —— 页面自己抓到的接口响应（站点只肯用接口发详情时走这条）
    *
-   * 显示出来是有原因的：两条路给的东西**可能不一样**，
+   * 显示出来是有原因的：几条路给的东西**可能不一样**，
    * 用户一眼就能看出这批是不是按页面看到的样子下的。
    */
-  parsePath?: 'iframe' | 'fetch';
-  /** 这一场实际用过的路（两条都用过就都记上） */
-  parsePaths?: Array<'iframe' | 'fetch'>;
+  parsePath?: 'iframe' | 'fetch' | 'api';
+  /** 这一场实际用过的路（几条都用过就都记上） */
+  parsePaths?: Array<'iframe' | 'fetch' | 'api'>;
   /** 快路是否被证明与页面渲染结果一致（一致了才敢让它接手） */
   parseTrusted?: boolean;
   cards: BatchCard[];
@@ -215,13 +216,17 @@ const RING_C = 2 * Math.PI * RING_R;
  * 「快路」    = 抓笔记页的 HTML —— 只有在跟页面渲染的结果**逐条比对过完全一致**
  *              之后才敢用它（否则宁可慢，也不能下到不一样的东西）
  * 「兜底抓取」= 页面没给出资源时临时抓一次 HTML 救场，没有可比对的基准
+ * 「接口响应」= 站点只肯用接口发详情时，走页面自己抓到的接口响应
  */
 function describeParsePaths(
-  paths: Array<'iframe' | 'fetch'>,
+  paths: Array<'iframe' | 'fetch' | 'api'>,
   trusted?: boolean,
 ): string {
   const frame = paths.includes('iframe');
   const fast = paths.includes('fetch');
+  const api = paths.includes('api');
+  if (frame && api) return ' · 页面渲染 + 接口响应';
+  if (api) return ' · 接口响应（页面自己抓到的详情）';
   if (frame && fast) {
     return trusted ? ' · 页面渲染 + 快路（已核对与页面一致）' : ' · 页面渲染 + 兜底抓取';
   }

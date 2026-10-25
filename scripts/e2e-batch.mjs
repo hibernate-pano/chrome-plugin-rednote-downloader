@@ -12,7 +12,7 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 
-import { makeRequestCounter, notePageHtml, serializeState, UNDEF } from './fake-site.mjs';
+import { feedApiJson, makeRequestCounter, notePageHtml, serializeState, UNDEF } from './fake-site.mjs';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -179,14 +179,34 @@ function profileHtml() {
  *            扩展必须退回 iframe，而且**只能多花一次抓取**，
  *            不能给每条笔记都白打一遍。
  *
+ * detailPath 决定「详情放在状态里的哪个位置」：
+ *   'noteDetailMap' —— 常见形状。
+ *   'currentNote'   —— 站点改版，详情挪到了别的地方。
+ *                       扩展必须照样找得到（位置变了不等于解析不出来了）。
+ *
+ * viaApi 决定「详情是不是只从接口来」：
+ *   true —— 页面自己 XHR 一次接口拿详情，而且**不写进状态**。
+ *           扩展只能从抓到的接口响应里把笔记找出来。
+ *
+ * viaApiXhr 跟 viaApi 一样，但用 **XHR + responseType: 'json'**（axios 那种）。
+ *   真站点就是这么发的；这种请求读 xhr.responseText 会抛，
+ *   扩展要是只读 responseText，这条路就断了。
+ *
  * mediaOverride 用来改写详情里的媒体直链 ——
  * 模拟「SSR 里那份跟页面渲染那份不是同一个东西」（真站点上完全可能：
  * SSR 少几个字段、地址是旧的、直链是坏的）。
  */
-function noteHtml(note, ssrDetail = true, mediaOverride = null) {
+function noteHtml(
+  note,
+  ssrDetail = true,
+  mediaOverride = null,
+  detailPath = 'noteDetailMap',
+  viaApi = false,
+  viaApiXhr = false,
+) {
   const detail = noteDetail(note);
   if (mediaOverride) mediaOverride(detail);
-  return notePageHtml({ note, detail, ssrDetail });
+  return notePageHtml({ note, detail, ssrDetail, detailPath, viaApi, viaApiXhr });
 }
 
 /**
@@ -195,12 +215,16 @@ function noteHtml(note, ssrDetail = true, mediaOverride = null) {
  * 用来验证扩展的判断对不对：
  * 页面渲染出来的那条直链是好的，SSR 里那条是坏的 ——
  * 扩展必须下页面那份（好），不能下 SSR 那份（坏）。
+ *
+ * **只能替换，不能就地改**：`h264` 数组里放的是 NOTES 里那条共享的 note.video，
+ * 就地改会把坏地址永久留在假站点的数据里 ——
+ * 后面几轮（哪怕已经把 ssrMediaDiffers 关掉了）也照样拿到坏地址，
+ * 测出来「扩展下了坏的直链」，其实坏的是假站点自己。
  */
 function breakVideoUrl(detail) {
   const h264 = detail.video?.media?.stream?.h264;
   if (!Array.isArray(h264) || h264.length === 0) return;
-  h264[0].masterUrl = BROKEN_VIDEO_URL;
-  h264[0].backupUrls = [BROKEN_VIDEO_URL];
+  h264[0] = { ...h264[0], masterUrl: BROKEN_VIDEO_URL, backupUrls: [BROKEN_VIDEO_URL] };
 }
 
 /* ------------------------------------------------------------------ */
@@ -282,13 +306,32 @@ function walk(dir, out = []) {
 }
 
 /**
+ * 这一轮新落盘的文件。
+ *
+ * 按「落盘时间」算，不按「跟上一轮比」——
+ * 文件名是按笔记内容生成的，每一轮都一样，
+ * 所以上一轮要是没清干净，「跟上一轮比」就永远算不出新增，
+ * 测出来是「一条都没下」，其实文件早就在那儿了。
+ */
+function freshSince(dir, sinceMs) {
+  return walk(dir).filter((f) => {
+    if (f.endsWith('.crdownload')) return false;
+    try {
+      return fs.statSync(f).mtimeMs >= sinceMs;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
  * 把扩展的下载方式切到「浏览器下载」。
  *
  * 未打包扩展的 ID 由**真实路径**派生（macOS 上 /tmp 是 /private/tmp 的软链）。
  */
+let extId = '';
 async function useBrowserEngine(targets, testDist) {
   const hex = createHash('sha256').update(fs.realpathSync(testDist)).digest('hex').slice(0, 32);
-  let extId = '';
   for (const c of hex) extId += String.fromCharCode(97 + parseInt(c, 16));
 
   let swTarget = targets.find(
@@ -305,6 +348,14 @@ async function useBrowserEngine(targets, testDist) {
 
   const sw = await connect(swTarget.webSocketDebuggerUrl);
   await sw.send('Runtime.enable');
+  sw.on((msg) => {
+    if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
+      console.log('   [SW]', (msg.params.args || []).map((a) => a.value ?? a.description ?? '').join(' ').slice(0, 400));
+    }
+    if (msg.method === 'Runtime.exceptionThrown') {
+      console.log('   [SW 异常]', (msg.params.exceptionDetails?.exception?.description || '').slice(0, 400));
+    }
+  });
   await sw.eval(
     `chrome.storage.local.set({'rednote.settings': {downloadMode: 'browser'}}).then(() => 'ok')`,
   );
@@ -355,6 +406,15 @@ async function main() {
   let ssrDetail = true;
   // 「SSR 里的直链跟页面渲染出来的不一样」—— 用来验证扩展是不是下到了页面看到的那一份。
   let ssrMediaDiffers = false;
+  // 「详情在状态里的位置」—— 站点改版时这个位置会变。
+  let detailPath = 'noteDetailMap';
+  // 「详情是不是只从接口来」—— 页面自己 XHR 拿，状态里没有。
+  let viaApi = false;
+  // 「详情只从接口来，而且是用 XHR + responseType:'json' 拿的」——
+  // 真站点用 axios，走的就是这条路。
+  let viaApiXhr = false;
+  // 每轮开始的时间：用来算「这一轮新落盘的文件」
+  let roundStart = Date.now();
   const { counter, record } = makeRequestCounter();
 
   const server = createServer((req, res) => {
@@ -371,6 +431,18 @@ async function main() {
       res.end(profileHtml());
       return;
     }
+    // 笔记详情接口（页面自己 XHR 拿的那份）
+    if (url.pathname === '/api/sns/web/v1/feed') {
+      const id = url.searchParams.get('note_id') ?? '';
+      const note = NOTES.find((n) => n.id === id);
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.end(
+        JSON.stringify(
+          note ? feedApiJson(note, noteDetail(note)) : { success: false, data: { items: [] } },
+        ),
+      );
+      return;
+    }
     const explore = url.pathname.match(/^\/explore\/([A-Za-z0-9_-]+)/);
     if (explore) {
       const note = NOTES.find((n) => n.id === explore[1]);
@@ -379,7 +451,14 @@ async function main() {
         // 导航给「页面渲染的那份」，抓取给「SSR 那份」。
         const isFetch = String(req.headers['sec-fetch-dest'] || '') === 'empty';
         res.end(
-          noteHtml(note, ssrDetail, isFetch && ssrMediaDiffers ? breakVideoUrl : null),
+          noteHtml(
+            note,
+            ssrDetail,
+            isFetch && ssrMediaDiffers ? breakVideoUrl : null,
+            detailPath,
+            viaApi,
+            viaApiXhr,
+          ),
         );
         return;
       }
@@ -420,6 +499,10 @@ async function main() {
   const cleanup = () => {
     chrome.kill();
     server.close();
+    if (process.env.KEEP_PROFILE) {
+      console.log(`\n（保留了 profile 目录：${profileDir}）`);
+      return;
+    }
     try {
       fs.rmSync(profileDir, { recursive: true, force: true });
     } catch {
@@ -470,6 +553,172 @@ async function main() {
         return { __EXC: res.exceptionDetails.exception?.description || 'exception' };
       }
       return res.result.value;
+    };
+
+    /**
+     * 问页面里那个钩子一个问题（跟扩展问它的是同一条通道）。
+     *
+     * 出问题时要知道「这一轮到底走的哪条路」——
+     * 解析失败可以有好几种原因（状态里没有、接口没抓到、钩子没起来），
+     * 不问清楚就只能靠猜。
+     */
+    const askPage = async (method, params = {}, timeoutMs = 3000) => {
+      const raw = await evaluate(`
+        new Promise((resolve) => {
+          const ch = document.documentElement.getAttribute('data-rednote-channel');
+          if (!ch) { resolve(JSON.stringify({ ok: false, error: '页面里没有钩子' })); return; }
+          const id = 'e2e-' + Math.random().toString(36).slice(2);
+          const done = (v) => {
+            clearTimeout(timer);
+            window.removeEventListener('message', onMsg);
+            resolve(JSON.stringify(v));
+          };
+          const onMsg = (e) => {
+            const d = e.data;
+            if (!d || d.__rednote !== ch || d.id !== id) return;
+            if (typeof d.method === 'string') return;  // 自己发出去的请求回声
+            done(d);
+          };
+          const timer = setTimeout(() => done({ ok: false, error: '超时' }), ${timeoutMs});
+          window.addEventListener('message', onMsg);
+          window.postMessage({ __rednote: ch, id, method: ${JSON.stringify(method)}, params: ${JSON.stringify(params)} }, '*');
+        })
+      `);
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return { ok: false, error: String(raw) };
+      }
+    };
+
+    /**
+     * 打开面板，等到它真的闲下来（按钮变回「开始下载」而且没禁用）。
+     *
+     * 卡片是边扫边挂的：解析还没完的时候，「开始下载」按钮写着「解析中…」
+     * 而且是禁用的。这时候点下去等于点了个禁用按钮，什么都不会发生 ——
+     * 测出来是「一条都没下」，看着像扩展坏了，其实是测试自己没点到。
+     */
+    const openPanelAndWait = async () => {
+      for (let i = 0; i < 40; i += 1) {
+        const ok = await evaluate(
+          `!!document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-fab')`,
+        );
+        if (ok) break;
+        await sleep(400);
+      }
+      await evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root').shadowRoot;
+          sr.querySelector('.rn-fab').click();
+          return true;
+        })()
+      `);
+      for (let i = 0; i < 80; i += 1) {
+        await sleep(400);
+        const raw = await evaluate(`
+          (() => {
+            const sr = document.querySelector('rednote-root')?.shadowRoot;
+            const btn = sr?.querySelector('.rn-footer .rn-btn[data-variant="primary"]');
+            return JSON.stringify({
+              cards: sr?.querySelectorAll('.rn-card').length ?? 0,
+              ready: /开始下载/.test(btn?.textContent || '') && btn?.disabled !== true,
+            });
+          })()
+        `);
+        const st = (() => {
+          try {
+            return JSON.parse(raw) || {};
+          } catch {
+            return {};
+          }
+        })();
+        if (st.cards >= 3 && st.ready) return st;
+      }
+      return null;
+    };
+
+    /**
+     * 跑一轮「主页批量下载」：重新加载页面 → 打开面板 → 全选 → 开始下载，
+     * 返回这一轮新落盘的文件。
+     *
+     * 每轮都要重新加载页面：那样才是新的 content script 实例，
+     * 解析路径的判断从头开始（这几轮测的就是「站点换形状时扩展还灵不灵」）。
+     */
+    const runRound = async () => {
+      await cdp.send('Page.navigate', {
+        url: `${origin}/user/profile/mockuser0001?xsec_token=mock`,
+      });
+      await sleep(2000);
+      // 等扫描出卡片，**并且等面板真的闲下来** ——
+      // 卡片是边扫边挂的：解析还没完的时候，「开始下载」按钮写着「解析中…」
+      // 而且是禁用的。这时候点下去等于点了个禁用按钮，什么都不会发生 ——
+      // 测出来就是「一条都没下」，看着像扩展坏了，其实是测试自己没点到。
+      await openPanelAndWait();
+
+      const roundStart = Date.now();
+      await evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root').shadowRoot;
+          const all = [...sr.querySelectorAll('.rn-toolbar-right .rn-btn')].find(b => /全选/.test(b.textContent));
+          if (all) all.click();
+          const start = sr.querySelector('.rn-footer .rn-btn[data-variant="primary"]');
+          if (start) start.click();
+          return true;
+        })()
+      `);
+
+      // 等这一批解析完：解析中时按钮写着「解析中…」，做完才变回「开始下载」
+      const startedAt = Date.now();
+      for (let t = 0; t < 120; t += 1) {
+        await sleep(500);
+        const st = await evaluate(`
+          (() => {
+            const sr = document.querySelector('rednote-root')?.shadowRoot;
+            return (sr?.querySelector('.rn-footer')?.textContent || '').slice(0, 60);
+          })()
+        `);
+        if (typeof st === 'string' && /开始下载/.test(st) && !/正在解析/.test(st)) break;
+      }
+      console.log(`   解析用时: ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+      // 这一轮到底走的哪条路（抓 HTML / 隐藏 iframe / 接口响应）
+      console.log('   解析路径:', JSON.stringify(await askPage('api.parsePath')));
+      console.log(`   站点请求: iframe ${counter.iframe} 个 / 抓取 ${counter.fetch} 次`);
+      let fresh = [];
+      for (let i = 0; i < 60; i += 1) {
+        await sleep(700);
+        fresh = freshSince(downloadRoot(), roundStart);
+        if (fresh.length >= 4) break;
+      }
+
+      const footer = await evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root').shadowRoot;
+          return JSON.stringify({
+            footer: sr.querySelector('.rn-footer')?.textContent?.slice(0, 200) || '',
+          });
+        })()
+      `);
+      console.log('   本轮目录:', walk(downloadRoot()).map((f) => path.relative(downloadRoot(), f)).join(' | '));
+      console.log('   本轮面板:', footer);
+
+      // 这一轮每张卡片的状态 —— 出问题时一眼能看出是「没解析出来」还是「解析了但没资源」
+      const states = await evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root').shadowRoot;
+          return JSON.stringify([...sr.querySelectorAll('.rn-card')].map(c => ({
+            title: c.querySelector('.rn-card-title')?.textContent || '',
+            meta: c.querySelector('.rn-card-meta')?.textContent || '',
+          })));
+        })()
+      `);
+      // 面板上写着的解析路径 —— 用户能看见「这批是怎么解析出来的」
+      const headSub = await evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root')?.shadowRoot;
+          return sr?.querySelector('.rn-panel .rn-head-sub')?.textContent || '';
+        })()
+      `);
+      return { fresh, states: JSON.parse(states || '[]'), headSub: String(headSub || '') };
     };
 
     console.log('▶ 打开假的主页…');
@@ -638,7 +887,7 @@ async function main() {
     `);
     await sleep(300);
 
-    const before = walk(downloadRoot());
+    roundStart = Date.now();
     console.log('▶ 点「开始下载」，触发批量解析 + 下载…');
     await evaluate(`
       (() => {
@@ -673,18 +922,16 @@ async function main() {
     // 等下载落盘。
     // 注意：Chrome 下一个正在下载的文件会先落成 xxx.crdownload，
     // 那不算下完 —— 数文件的时候必须把它排除，否则会在视频还没下完时就「达标」
-    let after = before;
     let settled = false;
     for (let i = 0; i < 60; i += 1) {
       await sleep(700);
-      after = walk(downloadRoot());
-      const fresh = after.filter((f) => !before.includes(f) && !f.endsWith('.crdownload'));
+      const fresh = freshSince(downloadRoot(), roundStart);
       if (fresh.length >= 4) {
         settled = true;
         break;
       }
     }
-    const fresh = after.filter((f) => !before.includes(f));
+    const fresh = freshSince(downloadRoot(), roundStart);
 
 
     check('批量文件全部落盘', settled && fresh.length === 4, `新增 ${fresh.length} 个：${fresh.map((f) => path.relative(downloadRoot(), f)).join(', ')}`);
@@ -791,7 +1038,7 @@ async function main() {
       `selected=${JSON.stringify(filterState.selected)} footerSub=${filterState.footerSub}`,
     );
 
-    const beforeVideo = walk(downloadRoot());
+    roundStart = Date.now();
     await evaluate(`
       (() => {
         const sr = document.querySelector('rednote-root').shadowRoot;
@@ -806,7 +1053,7 @@ async function main() {
     for (let i = 0; i < 90; i += 1) {
       await sleep(700);
       videoFresh = walk(downloadRoot())
-        .filter((f) => !beforeVideo.includes(f))
+        .filter((f) => freshSince(downloadRoot(), roundStart).includes(f))
         .filter((f) => !f.endsWith('.crdownload'));
       if (videoFresh.some((f) => f.endsWith('.mp4'))) break;
     }
@@ -878,7 +1125,7 @@ async function main() {
     );
     await sleep(700);
 
-    const beforePerAuthor = walk(downloadRoot());
+    roundStart = Date.now();
     await evaluate(`
       (() => {
         const sr = document.querySelector('rednote-root').shadowRoot;
@@ -892,7 +1139,7 @@ async function main() {
     for (let i = 0; i < 90; i += 1) {
       await sleep(700);
       perAuthorFresh = walk(downloadRoot())
-        .filter((f) => !beforePerAuthor.includes(f))
+        .filter((f) => freshSince(downloadRoot(), roundStart).includes(f))
         .filter((f) => !f.endsWith('.crdownload'));
       if (perAuthorFresh.length >= 4) break;
     }
@@ -944,7 +1191,7 @@ async function main() {
     `);
     await sleep(700);
 
-    const beforeFlat = walk(downloadRoot());
+    roundStart = Date.now();
     await evaluate(`
       (() => {
         const sr = document.querySelector('rednote-root').shadowRoot;
@@ -958,7 +1205,7 @@ async function main() {
     for (let i = 0; i < 90; i += 1) {
       await sleep(700);
       flatFresh = walk(downloadRoot())
-        .filter((f) => !beforeFlat.includes(f))
+        .filter((f) => freshSince(downloadRoot(), roundStart).includes(f))
         .filter((f) => !f.endsWith('.crdownload'));
       if (flatFresh.length >= 4) break;
     }
@@ -1006,31 +1253,10 @@ async function main() {
       url: `${origin}/user/profile/mockuser0001?xsec_token=mock`,
     });
     await sleep(2000);
-    for (let i = 0; i < 40; i += 1) {
-      const ok = await evaluate(
-        `!!document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-fab')`,
-      );
-      if (ok) break;
-      await sleep(400);
-    }
-    await evaluate(`
-      (() => {
-        const sr = document.querySelector('rednote-root').shadowRoot;
-        sr.querySelector('.rn-fab').click();
-        return true;
-      })()
-    `);
+    await openPanelAndWait();
 
-    // 等扫描出卡片
-    for (let i = 0; i < 40; i += 1) {
-      await sleep(400);
-      const n = await evaluate(
-        `document.querySelector('rednote-root').shadowRoot.querySelectorAll('.rn-card').length`,
-      );
-      if (n >= 3) break;
-    }
 
-    const beforeNoSsr = walk(downloadRoot());
+    roundStart = Date.now();
     await evaluate(`
       (() => {
         const sr = document.querySelector('rednote-root').shadowRoot;
@@ -1045,9 +1271,7 @@ async function main() {
     let noSsrFresh = [];
     for (let i = 0; i < 60; i += 1) {
       await sleep(700);
-      noSsrFresh = walk(downloadRoot()).filter(
-        (f) => !beforeNoSsr.includes(f) && !f.endsWith('.crdownload'),
-      );
+      noSsrFresh = freshSince(downloadRoot(), roundStart);
       if (noSsrFresh.length >= 4) break;
     }
     check(
@@ -1091,30 +1315,10 @@ async function main() {
       url: `${origin}/user/profile/mockuser0001?xsec_token=mock`,
     });
     await sleep(2000);
-    for (let i = 0; i < 40; i += 1) {
-      const ok = await evaluate(
-        `!!document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-fab')`,
-      );
-      if (ok) break;
-      await sleep(400);
-    }
-    await evaluate(`
-      (() => {
-        const sr = document.querySelector('rednote-root').shadowRoot;
-        sr.querySelector('.rn-fab').click();
-        return true;
-      })()
-    `);
+    await openPanelAndWait();
 
-    for (let i = 0; i < 40; i += 1) {
-      await sleep(400);
-      const n = await evaluate(
-        `document.querySelector('rednote-root').shadowRoot.querySelectorAll('.rn-card').length`,
-      );
-      if (n >= 3) break;
-    }
 
-    const beforeDiff = walk(downloadRoot());
+    roundStart = Date.now();
     await evaluate(`
       (() => {
         const sr = document.querySelector('rednote-root').shadowRoot;
@@ -1129,9 +1333,7 @@ async function main() {
     let diffFresh = [];
     for (let i = 0; i < 60; i += 1) {
       await sleep(700);
-      diffFresh = walk(downloadRoot()).filter(
-        (f) => !beforeDiff.includes(f) && !f.endsWith('.crdownload'),
-      );
+      diffFresh = freshSince(downloadRoot(), roundStart);
       if (diffFresh.length >= 4) break;
     }
 
@@ -1155,6 +1357,111 @@ async function main() {
     );
 
     for (const f of diffFresh) {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 第六轮：详情被挪到了状态里的另一个位置                                */
+    /* ------------------------------------------------------------------ */
+
+    console.log('\n▶ 换成「详情挪了位置」的站点，再下载一次…');
+    detailPath = 'currentNote';
+    ssrDetail = true;
+    ssrMediaDiffers = false;
+    counter.fetch = 0;
+    counter.iframe = 0;
+    counter.other = 0;
+
+    const moved = await runRound();
+    check(
+      '详情换了位置也照样解析得出来（深搜兜底）',
+      moved.fresh.length === 4,
+      `新增 ${moved.fresh.length} 个 · 卡片：${JSON.stringify(moved.states)}`,
+    );
+    check(
+      '换了位置时下载的还是视频，不是别的',
+      moved.fresh.some((f) => f.endsWith('.mp4')) &&
+        moved.fresh.filter((f) => /\.(jpg|jpeg|png|webp)$/i.test(f)).length === 3,
+      moved.fresh.map((f) => path.basename(f)).join(', '),
+    );
+
+    for (const f of moved.fresh) {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 第七轮：详情只从接口来（状态里压根没有）                             */
+    /* ------------------------------------------------------------------ */
+
+    console.log('\n▶ 换成「详情只从接口来」的站点，再下载一次…');
+    viaApi = true;
+    detailPath = 'noteDetailMap';
+    counter.fetch = 0;
+    counter.iframe = 0;
+    counter.other = 0;
+
+    const viaApiFiles = await runRound();
+    check(
+      '详情只从接口来时也解析得出来（从抓到的接口响应里找）',
+      viaApiFiles.fresh.length === 4,
+      `新增 ${viaApiFiles.fresh.length} 个 · 卡片：${JSON.stringify(viaApiFiles.states)}`,
+    );
+    check(
+      '接口来的详情下的是视频',
+      viaApiFiles.fresh.some((f) => f.endsWith('.mp4')),
+      viaApiFiles.fresh.map((f) => path.basename(f)).join(', '),
+    );
+    check(
+      '面板上写明这批走的是「接口响应」',
+      /接口响应/.test(viaApiFiles.headSub),
+      viaApiFiles.headSub,
+    );
+
+    for (const f of viaApiFiles.fresh) {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 第八轮：详情只从接口来，而且是用 XHR + responseType:'json' 拿的     */
+    /* ------------------------------------------------------------------ */
+
+    console.log("\n▶ 换成「详情用 axios 那种 XHR 拿」的站点，再下载一次…");
+    viaApi = false;
+    viaApiXhr = true;
+    counter.fetch = 0;
+    counter.iframe = 0;
+    counter.other = 0;
+
+    const viaXhrFiles = await runRound();
+    check(
+      'XHR + responseType:json 的接口响应也抓得到（真站点用 axios）',
+      viaXhrFiles.fresh.length === 4,
+      `新增 ${viaXhrFiles.fresh.length} 个 · 卡片：${JSON.stringify(viaXhrFiles.states)}`,
+    );
+    check(
+      'XHR 来的详情下的是视频',
+      viaXhrFiles.fresh.some((f) => f.endsWith('.mp4')),
+      viaXhrFiles.fresh.map((f) => path.basename(f)).join(', '),
+    );
+    check(
+      'XHR 来的详情走的是「接口响应」那条路（不是 SSR —— SSR 里压根没有详情）',
+      /接口响应/.test(viaXhrFiles.headSub),
+      viaXhrFiles.headSub,
+    );
+
+    for (const f of viaXhrFiles.fresh) {
       try {
         fs.rmSync(f, { force: true });
       } catch {

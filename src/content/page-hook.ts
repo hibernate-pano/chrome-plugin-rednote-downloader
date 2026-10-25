@@ -13,6 +13,7 @@ import {
   collectNoteRefs,
   extractNoteFromState,
   extractUser,
+  findNoteInPayload,
   hasMedia,
   isObj,
   parseInitialState,
@@ -40,6 +41,13 @@ interface CapturedResponse {
 
 const captured: CapturedResponse[] = [];
 const CAPTURE_LIMIT = 60;
+/**
+ * 要抓的接口。
+ *
+ * **注意结尾不能带斜杠**：站点的接口地址后面跟的是查询串
+ * （`/api/sns/web/v1/feed?note_id=xxx&xsec_token=yyy`），
+ * 带斜杠的写法一个都匹配不上 —— 笔记详情就永远抓不到。
+ */
 const CAPTURE_PATTERNS = [
   /\/api\/sns\/web\/v1\/user_posted/,
   /\/api\/sns\/web\/v1\/feed/,
@@ -98,12 +106,21 @@ function installXhrHook(): void {
     this.addEventListener('load', () => {
       const url = (this as any).__rednoteUrl ?? '';
       if (!shouldCapture(url)) return;
+      let body: any = null;
       try {
-        const body = JSON.parse(this.responseText);
-        record(url, body);
+        body = JSON.parse(this.responseText);
       } catch {
-        /* ignore */
+        // **responseType 不是 text 时读 responseText 会抛**（InvalidStateError）——
+        // 站点用 axios 之类带 responseType: 'json' 就会走到这里。
+        // 那种情况下 response 已经是解析好的对象了，直接用它。
+        try {
+          body = this.response;
+        } catch {
+          body = null;
+        }
       }
+      // 只留对象/数组：blob、字符串这些留着也没用，还会让跨窗口传递变大
+      if (body && typeof body === 'object') record(url, body);
     });
     return (originalSend as any).apply(this, args);
   };
@@ -162,6 +179,12 @@ const handlers: Record<string, Handler> = {
       return { note: null, state: false, error: '页面数据尚未就绪' };
     }
     let note = extractNoteFromState(state, params?.noteId);
+    // 已知路径取到的可能只是个空壳（只有 id 和标题，媒体还没补上）。
+    // 这种不算数 —— 把整份状态翻一遍，找那条**带媒体**的。
+    if (!note || !hasMedia(note)) {
+      const deep = findNoteInPayload(state, params?.noteId);
+      if (deep) note = deep;
+    }
     // 笔记详情页：URL 里的 id 和状态里的对不上时（站点重定向过），
     // 退回「页面当前这条」是对的。批量解析不走这条 —— 那里拿错就是下错。
     if (!note && params?.loose) note = extractNoteFromState(state);
@@ -247,35 +270,61 @@ const handlers: Record<string, Handler> = {
 
     // ---- 主路：隐藏 iframe（1.0.0 就是这么干的）----
     const viaFrame = await loadNoteViaFrame(noteId, xsecToken, deadline).catch(() => null);
-    if (viaFrame && hasMedia(viaFrame)) {
+    if (viaFrame?.note && hasMedia(viaFrame.note)) {
       // 页面给的东西就是权威结果。
       // 顺便让快路自证一次（不阻塞这一条：验证是后台跑的，结果只影响后面的笔记）。
-      if (fastPathState === 'unknown' && viaFrame.videos.length > 0) {
-        void startValidation(noteId, xsecToken, viaFrame);
+      if (fastPathState === 'unknown' && viaFrame.note.videos.length > 0) {
+        void startValidation(noteId, xsecToken, viaFrame.note);
       }
-      parsePath = 'iframe';
-      usedPaths.add('iframe');
-      return { ok: true, note: viaFrame, via: 'iframe' };
+      // 走的是接口响应就报 'api'，别混成 'iframe' ——
+      // 排查「为什么解析不出来」全靠这个字段说是哪条路给的。
+      const fromApi = viaFrame.via === 'api';
+      parsePath = fromApi ? 'api' : 'iframe';
+      usedPaths.add(parsePath);
+      return { ok: true, note: viaFrame.note, via: fromApi ? 'iframe-api' : 'iframe' };
     }
 
-    // ---- 兜底：抓 HTML（页面没给出媒体的时候救一把）----
-    if (fastPathState !== 'unusable') {
-      const viaFetch = await fetchNotePage(noteId, xsecToken).catch(() => null);
-      if (viaFetch?.note) {
-        parsePath = 'fetch';
-        usedPaths.add('fetch');
-        return { ok: true, note: viaFetch.note, via: 'fetch' };
+    // ---- 兜底一：把 iframe 里的状态翻个底朝天 ----
+    // 页面上视频明明在，状态里却找不到 —— 说明站点把详情挪到了别的位置。
+    // 把整份状态深搜一遍，找到「id 对得上、并且带媒体」的那条就用它。
+    if (viaFrame?.state) {
+      const deep = findNoteInPayload(viaFrame.state, noteId);
+      if (deep) {
+        parsePath = 'iframe';
+        usedPaths.add('iframe');
+        return { ok: true, note: deep, via: 'iframe-deep' };
       }
-      if (viaFetch?.verdict === 'broken') fastPathState = 'unusable';
     }
+
+    // ---- 兜底二：页面自己抓到的接口响应 ----
+    // 笔记详情是页面用 XHR 拿的，那份响应里有最全的媒体信息。
+    // （用户之前打开过这条笔记的话，响应就在手上。）
+    const viaApi = noteFromCaptured(noteId);
+    if (viaApi) {
+      parsePath = 'api';
+      usedPaths.add('api');
+      return { ok: true, note: viaApi, via: 'api' };
+    }
+
+    // ---- 兜底三：抓 HTML ----
+    // 注意：这条路**永远不禁用**。
+    // 自证只能决定「快路要不要当主力」，不能决定「这条路还能不能用」——
+    // 一旦用它把唯一的救命稻草掐断，解析就彻底没救了。
+    const viaFetch = await fetchNotePage(noteId, xsecToken).catch(() => null);
+    if (viaFetch?.note) {
+      parsePath = 'fetch';
+      usedPaths.add('fetch');
+      return { ok: true, note: viaFetch.note, via: 'fetch' };
+    }
+    if (viaFetch?.verdict === 'broken') fastPathState = 'unusable';
 
     // ---- 页面给了一个空壳：笔记在，但媒体还没出来（或者这条确实没有媒体）----
     // 这不是失败：解析确实成功了，只是这条没有可下载的东西。
     // 界面会写「未取到资源」，跟「解析失败」区分开。
-    if (viaFrame) {
+    if (viaFrame?.note) {
       parsePath = 'iframe';
       usedPaths.add('iframe');
-      return { ok: true, note: viaFrame, via: 'iframe' };
+      return { ok: true, note: viaFrame.note, via: 'iframe' };
     }
 
     return { ok: false, error: '无法获取笔记详情' };
@@ -284,8 +333,8 @@ const handlers: Record<string, Handler> = {
   /**
    * 这一场解析走的是哪条路（界面上要显示出来）。
    *
-   * 「快路」= 抓 HTML；「页面渲染」= 隐藏 iframe。
-   * 显示出来是因为两条路给的东西**可能不一样** ——
+   * 「快路」= 抓 HTML；「页面渲染」= 隐藏 iframe；「接口」= 页面自己抓的接口响应。
+   * 显示出来是因为几条路给的东西**可能不一样** ——
    * 用户一眼就能看出这批内容是不是按页面看到的样子下的。
    */
   'api.parsePath': () => ({
@@ -302,18 +351,22 @@ const handlers: Record<string, Handler> = {
 const NOTE_DETAIL_BUDGET_MS = 20000;
 /** 抓 HTML 单次请求的上限 —— 请求卡住时不能把整条链路耗光 */
 const FETCH_TIMEOUT_MS = 5000;
-/** 隐藏 iframe 等媒体补齐的上限 */
-const FRAME_WAIT_MS = 10000;
+/** 隐藏 iframe 等笔记出现的上限（1.0.0 就是 8s） */
+const FRAME_WAIT_MS = 8000;
 /** 隐藏 iframe 里笔记已经出现、但媒体还没补上时，最多再等多久 */
-const FRAME_MEDIA_WAIT_MS = 4000;
+const FRAME_MEDIA_WAIT_MS = 2500;
+/** 向 iframe 里的页面钩子要接口响应的次数上限 */
+const API_CAPTURE_TRIES = 6;
+/** 两次要接口响应之间的间隔（毫秒） */
+const API_CAPTURE_RETRY_MS = 700;
 
 /**
  * 这一场解析实际走的是哪条路。
  */
-let parsePath: 'iframe' | 'fetch' | 'none' = 'none';
+let parsePath: 'iframe' | 'fetch' | 'api' | 'none' = 'none';
 
-/** 这一场里实际用过的路（两条都用过就都记上） */
-const usedPaths = new Set<'iframe' | 'fetch'>();
+/** 这一场里实际用过的路（几条都用过就都记上） */
+const usedPaths = new Set<'iframe' | 'fetch' | 'api'>();
 
 /**
  * 抓 HTML 这条路的状态。
@@ -426,6 +479,12 @@ async function fetchNotePage(
   try {
     const response = await fetch(url, {
       credentials: 'include',
+      // 必须绕开缓存：这份 HTML 是拿来跟「页面渲染出来的那份」做比对的。
+      // 拿缓存的比对，等于自己跟自己比 —— 结论永远是「一致」，
+      // 于是快路被当成可信的，结果下到的是一份早就过期的直链
+      // （签名过期、清晰度不对、跟页面上看到的不是同一个文件）。
+      // 用户反馈「效果不如 1.0.0」，根子就在这儿。
+      cache: 'no-store',
       signal: controller.signal,
     });
     if (!response.ok) return { note: null, verdict: 'broken' };
@@ -467,19 +526,22 @@ async function fetchNotePage(
  * **媒体是后补的，所以要给它一点时间。**
  * 页面的状态是一点点填进来的：一开始只有 id、标题这些，
  * 视频直链是后面 XHR 回来才补上的。
- * 笔记一出现就先记下来，最多再等 4 秒让媒体补齐；
+ * 笔记一出现就先记下来，最多再等一会儿让媒体补齐；
  * 补上了就用带媒体的这份，补不上也把笔记返回 ——
  * 判成「解析失败」是不诚实的（这条笔记确实解析出来了，只是它没有可下载的资源），
  * 但也不能干等十几秒：几百条笔记那样等下去就没完了。
  *
  * deadline 是整条链路的截止时间（抓 HTML 可能已经花掉几秒），
  * 不能在这里又从头给一份完整预算。
+ *
+ * 返回值里带上**原始状态**：已知路径取不到时，调用方还能把整份状态深搜一遍
+ * （站点把详情挪到别的位置时，只有深搜救得回来）。
  */
 async function loadNoteViaFrame(
   noteId: string,
   xsecToken: string | undefined,
   deadline: number,
-): Promise<RawNote | null> {
+): Promise<{ note: RawNote | null; state: any; via?: 'frame' | 'api' }> {
   const url = `/explore/${encodeURIComponent(noteId)}${xsecToken ? `?xsec_token=${encodeURIComponent(xsecToken)}` : ''}`;
   const frame = document.createElement('iframe');
   frame.style.cssText =
@@ -487,11 +549,16 @@ async function loadNoteViaFrame(
   frame.src = url;
   document.body.appendChild(frame);
 
+  let lastState: any = null;
   try {
     // 笔记页是 SSR 的，状态内联在 HTML 里，实测 370ms 就能读到。
     const end = Math.min(deadline, Date.now() + FRAME_WAIT_MS);
     let shell: RawNote | null = null;
     let shellAt = 0;
+    // 问 iframe 里的页面钩子要接口响应的次数与间隔：
+    // 钩子起来 ≠ XHR 回来了，所以要问几次，但别把 8 秒的窗口耗光。
+    let apiTries = 0;
+    let nextApiTry = 0;
     while (Date.now() < end) {
       await new Promise((r) => setTimeout(r, 80));
       let state: any = null;
@@ -500,25 +567,139 @@ async function loadNoteViaFrame(
       } catch {
         state = null;
       }
-      if (!state) continue;
-      const note = extractNoteFromState(state, noteId);
-      if (!note) continue;
-      // 有媒体 —— 直接用
-      if (hasMedia(note)) return note;
-      // 空壳 —— 记下来，等媒体补齐
-      if (!shell) {
-        shell = note;
-        shellAt = Date.now();
-      } else if (Date.now() - shellAt > FRAME_MEDIA_WAIT_MS) {
-        // 等够了还是没有媒体 —— 这条笔记就是没有可下载的资源
-        return shell;
+      if (state) {
+        lastState = state;
+        const note = extractNoteFromState(state, noteId);
+        if (note) {
+          // 有媒体 —— 直接用
+          if (hasMedia(note)) return { note, state };
+          // 空壳 —— 记下来，等媒体补齐
+          if (!shell) {
+            shell = note;
+            shellAt = Date.now();
+          } else if (Date.now() - shellAt > FRAME_MEDIA_WAIT_MS) {
+            // 等够了还是没有媒体 —— 这条笔记可能真的没有资源，
+            // 也可能详情被放到了状态里别的地方（交给调用方深搜）
+            return { note: shell, state };
+          }
+        }
+      }
+
+      // 详情也可能是页面用 XHR 拿的（接口响应里才有媒体，状态里压根没有）。
+      // 问一次 iframe 里那个页面钩子：它抓到了哪些接口响应。
+      //
+      // **不能等「状态里出现空壳」才问**（这是之前踩的坑）：
+      // 实测（2026-10-24 真实站点）未登录时笔记页 SSR 里的 noteDetailMap
+      // 就是空的 —— 详情是页面 JS 跑起来之后用 XHR 拉的。
+      // 这种站点上状态里压根不会有这条笔记，「等空壳」等于永远等不到，
+      // 而接口响应是那时唯一拿得到媒体的地方 ——
+      // 于是整条链路一条都解析不出来（用户反馈：登录了也解析不了视频）。
+      //
+      // 所以改成：只要 iframe 里的钩子起来了就问，问不到就隔一会儿再问
+      // （钩子起来了不等于 XHR 回来了，得给接口响应落地的时间）。
+      if (apiTries < API_CAPTURE_TRIES && Date.now() >= nextApiTry && frameHasHook(frame)) {
+        nextApiTry = Date.now() + API_CAPTURE_RETRY_MS;
+        apiTries += 1;
+        const captured = await askFrame(frame, 'api.captured', null, 1200);
+        const list = Array.isArray(captured) ? captured : [];
+        for (let i = list.length - 1; i >= 0; i -= 1) {
+          const note = findNoteInPayload(list[i]?.body, noteId);
+          // 这条笔记是从「接口响应」里来的，不是从页面的状态里来的 ——
+          // 报路径时要说实话（排查问题全靠这个字段）。
+          if (note) return { note, state: lastState, via: 'api' };
+        }
       }
     }
     // 状态一直没出现：算失败
-    return shell;
+    return { note: shell, state: lastState };
   } finally {
     frame.remove();
   }
+}
+
+/**
+ * 从页面自己抓到的接口响应里找这条笔记。
+ *
+ * 笔记详情是页面用 XHR 拿的，那份响应里的媒体信息最全
+ * （直链、清晰度、时长都是原始的）。
+ * 用户之前打开过这条笔记的话，响应就在手上。
+ */
+function noteFromCaptured(noteId: string): RawNote | null {
+  // 从新到旧找：后抓到的响应更新鲜
+  for (let i = captured.length - 1; i >= 0; i -= 1) {
+    const entry = captured[i];
+    if (!entry?.body) continue;
+    const note = findNoteInPayload(entry.body, noteId);
+    if (note) return note;
+  }
+  return null;
+}
+
+/**
+ * iframe 里的页面钩子起来了吗？
+ *
+ * 钩子是在 document_start 注入的，它会在 <html> 上写一个通道号；
+ * 没有这个通道号就等于没有钩子，问了也白问（还白等一个超时）。
+ */
+function frameHasHook(frame: HTMLIFrameElement): boolean {
+  try {
+    return Boolean(frame.contentDocument?.documentElement?.getAttribute(CHANNEL_ATTR));
+  } catch {
+    return false;
+  }
+}
+
+/** 跨窗口问一次：给 iframe 里的页面钩子发请求，等它的回答 */
+let frameSeq = 0;
+function askFrame(
+  frame: HTMLIFrameElement,
+  method: string,
+  params: unknown,
+  timeoutMs: number,
+): Promise<any> {
+  return new Promise((resolve) => {
+    let channel = '';
+    try {
+      channel = frame.contentDocument?.documentElement?.getAttribute(CHANNEL_ATTR) ?? '';
+    } catch {
+      channel = '';
+    }
+    // iframe 里的钩子还没起来（或者那个页面没装钩子）→ 问不了
+    if (!channel) {
+      resolve(null);
+      return;
+    }
+
+    const id = `f${++frameSeq}`;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = (): void => {
+      if (timer) clearTimeout(timer);
+      try {
+        frame.contentWindow?.removeEventListener('message', onMessage);
+      } catch {
+        /* ignore */
+      }
+    };
+    const onMessage = (event: MessageEvent): void => {
+      if (event.source !== frame.contentWindow) return;
+      const data = event.data as any;
+      if (!data || data.__rednote !== channel || data.id !== id) return;
+      cleanup();
+      resolve(data.ok ? data.result : null);
+    };
+
+    try {
+      frame.contentWindow?.addEventListener('message', onMessage);
+      timer = setTimeout(() => {
+        cleanup();
+        resolve(null);
+      }, timeoutMs);
+      frame.contentWindow?.postMessage({ __rednote: channel, id, method, params }, '*');
+    } catch {
+      cleanup();
+      resolve(null);
+    }
+  });
 }
 
 /** 拿到站点 Pinia 里的 user store（页面内部数据源） */
@@ -551,7 +732,18 @@ function describeError(err: unknown): string {
 }
 
 window.addEventListener('message', (event) => {
-  if (event.source !== window) return;
+  // **同窗消息和跨窗口消息要分开看**：
+  // - 同窗（隔离世界 ↔ 页面世界）：event.source 就是自己
+  // - 父页面问 iframe：event.source 是**父窗口**，不是自己
+  //
+  // 只认「source === window」的话，父页面往隐藏 iframe 里问话永远问不到：
+  // 消息子窗口收得到（实测），却被这条守卫挡掉，钩子从不回话，
+  // 扩展只能等到超时 —— 于是「详情只从接口来」的笔记永远解析不出来
+  // （用户反馈：登录了也解析不了视频）。
+  //
+  // 通道号才是真正的身份凭证：父页面是同源的才读得到通道号，
+  // 跨站页面 iframe 进来也伪造不出请求。
+  if (event.source !== window && event.source !== window.parent) return;
   const data = event.data;
   if (!isObj(data) || data.__rednote !== CHANNEL) return;
 
