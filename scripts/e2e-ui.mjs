@@ -20,7 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { notePageHtml } from './fake-site.mjs';
+import { notePageHtml, serializeState } from './fake-site.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'dist');
@@ -85,6 +85,26 @@ function noteDetail(note, origin) {
   };
 }
 
+/** 主页的状态 —— 形状对齐真实的 user_posted 响应 */
+function profileState() {
+  return {
+    user: {
+      userPageData: { basicInfo: { nickname: AUTHOR } },
+      notes: NOTES.map((n) => ({
+        id: n.id,
+        xsec_token: n.token,
+        note_card: {
+          display_title: n.title,
+          type: 'video',
+          cover: { url_default: '' },
+          interact_info: { liked_count: 42 },
+        },
+      })),
+    },
+    note: { firstNoteId: NOTES[0].id, noteDetailMap: {}, currentNoteId: undefined },
+  };
+}
+
 function profileHtml() {
   const cards = NOTES.map(
     (n) => `
@@ -98,6 +118,7 @@ function profileHtml() {
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>${AUTHOR} - 小红书</title>
+<script>window.__INITIAL_STATE__ = ${serializeState(profileState())};</script>
 </head><body><div id="app"><div class="feeds-container">${cards}</div></div></body></html>`;
 }
 
@@ -486,6 +507,152 @@ async function main() {
       '折叠/展开不炸，行还在',
       collapse?.ok && collapse?.rowsBack >= 1,
       JSON.stringify(collapse),
+    );
+
+    /* ================================================================ */
+    /* 问题 5：主页 hover 出来的快捷下载按钮要能点                        */
+    /* ================================================================ */
+    console.log('\n▶ 问题 5：主页 hover 快捷下载按钮');
+
+    await cdp.send('Page.navigate', { url: `${origin}/user/profile/mockuser0001` });
+    await sleep(2500);
+
+    let injected = false;
+    for (let i = 0; i < 40; i += 1) {
+      injected = await evaluate(
+        `!!document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-hover-btn')`,
+      );
+      if (injected) break;
+      await sleep(400);
+    }
+    check('主页上装好了 hover 快捷下载按钮', Boolean(injected));
+
+    const hoverState = () =>
+      evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root')?.shadowRoot;
+          const btn = sr?.querySelector('.rn-hover-btn');
+          if (!btn) return { show: null, rect: null };
+          const r = btn.getBoundingClientRect();
+          return {
+            show: btn.dataset.show,
+            rect: { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height },
+          };
+        })()
+      `);
+
+    // 鼠标移到第一张卡片上 → 按钮冒出来
+    const card = await evaluate(`
+      (() => {
+        const c = document.querySelector('section.note-item');
+        if (!c) return null;
+        const r = c.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      })()
+    `);
+    check('主页上有笔记卡片', Boolean(card), JSON.stringify(card));
+
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: card.x,
+      y: card.y,
+      button: 'none',
+    });
+    await sleep(400);
+    const onCard = await hoverState();
+    check('鼠标停在卡片上时按钮出现', onCard?.show === 'true', `data-show=${onCard?.show}`);
+
+    // 鼠标从卡片移到按钮上 → 按钮不能消失（这是修好之前点不到的原因）
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: onCard.rect.x,
+      y: onCard.rect.y,
+      button: 'none',
+    });
+    await sleep(400);
+    const onButton = await hoverState();
+    check(
+      '鼠标移到按钮上时按钮不消失',
+      onButton?.show === 'true',
+      `data-show=${onButton?.show} rect=${JSON.stringify(onButton?.rect)}`,
+    );
+
+    // 点它 → 得有反应
+    //
+    // 光看 data-show 不够：按钮还得真的能接住鼠标。
+    // 外层 .rn-root 是 pointer-events:none（它盖住整个视口，不这样页面就没法点），
+    // 按钮自己不开 auto 的话，鼠标事件会直接穿透过去 —— 按钮看着在，点了没反应。
+    const hit = await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root')?.shadowRoot;
+        const btn = sr?.querySelector('.rn-hover-btn');
+        if (!btn) return { pe: null, isBtn: false };
+        const r = btn.getBoundingClientRect();
+        // 从 shadow root 里测，才看得到 shadow 内部真正接住鼠标的是谁。
+        // 正中间是按钮里的图标，所以命中结果可能是它的子元素 —— 落在按钮里就算数。
+        const top = sr.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return { pe: getComputedStyle(btn).pointerEvents, isBtn: Boolean(top && (top === btn || btn.contains(top))) };
+      })()
+    `);
+    check(
+      '按钮能接住鼠标（pointer-events + 命中测试）',
+      hit.pe === 'auto' && hit.isBtn === true,
+      `pointer-events=${hit.pe} 命中按钮=${hit.isBtn}`,
+    );
+
+    const toastsBefore = await evaluate(`
+      document.querySelector('rednote-root')?.shadowRoot?.querySelectorAll('.rn-toast').length ?? 0
+    `);
+    // 按「按钮此刻的位置」点：真人也是看着当前的位置点的。
+    // 用几帧之前量到的坐标会因为缩放动画/布局微调点空。
+    const clickAt = (await hoverState())?.rect ?? onButton.rect;
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: clickAt.x,
+      y: clickAt.y,
+      button: 'none',
+    });
+    await sleep(80);
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: clickAt.x,
+      y: clickAt.y,
+      button: 'left',
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: clickAt.x,
+      y: clickAt.y,
+      button: 'left',
+      clickCount: 1,
+    });
+    // 点击处理的第一步就是 hide()：按钮被藏了说明事件确实送到了它手上。
+    // 光看「有没有新提示」分不清「没点到」和「点到了但后面出错」。
+    await sleep(150);
+    const hiddenAfterClick = await evaluate(`
+      document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-hover-btn')?.dataset.show ?? null
+    `);
+    check('点击事件送达到了按钮（按钮随即收起）', hiddenAfterClick === 'false', `data-show=${hiddenAfterClick}`);
+
+    // 提示有时限（成功提示 3.2s 后自动消失），只等一次容易正好错过 ——
+    // 每 200ms 看一次，看到新提示就收工。
+    let toast = '';
+    for (let i = 0; i < 40; i += 1) {
+      await sleep(200);
+      toast = await evaluate(`
+        [...document.querySelector('rednote-root')?.shadowRoot?.querySelectorAll('.rn-toast') ?? []]
+          .map((t) => t.textContent).join(' | ')
+      `);
+      if (String(toast).trim()) break;
+    }
+    const toastsAfter = await evaluate(`
+      document.querySelector('rednote-root')?.shadowRoot?.querySelectorAll('.rn-toast').length ?? 0
+    `);
+    check(
+      '点按钮真的触发了下载（出现新的提示）',
+      toastsAfter > toastsBefore && /已保存|已开始|解析|下载/.test(String(toast)),
+      `before=${toastsBefore} after=${toastsAfter} toast=${String(toast)}`,
     );
   } finally {
     cleanup();

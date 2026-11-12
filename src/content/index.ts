@@ -30,6 +30,23 @@ import { icon } from './ui/icons';
 const NOTE_KEY = 'note';
 const BATCH_KEY = 'batch';
 
+/**
+ * 事件路径里最近的那个笔记卡片。
+ *
+ * 为什么不用 event.target.closest：
+ * 鼠标移进 shadow DOM 里的按钮时，event.target 会被**重定向成宿主元素**
+ * （rednote-root），closest 找不到卡片 —— 于是快捷下载按钮在鼠标还没碰到它时
+ * 就被藏起来了，用户根本点不到。composedPath 给的是真实路径。
+ */
+function findNoteItem(path: EventTarget[]): HTMLElement | null {
+  for (const node of path) {
+    if (node instanceof HTMLElement && node.matches('section.note-item, .note-item')) {
+      return node;
+    }
+  }
+  return null;
+}
+
 class App {
   private bridge = new PageBridge();
   private detector: Detector;
@@ -793,8 +810,12 @@ class App {
       'mouseover',
       (event) => {
         if (this.pageKind !== 'profile') return;
-        const target = event.target as HTMLElement | null;
-        const item = target?.closest('section.note-item, .note-item') as HTMLElement | null;
+        // 按钮住在 shadow root 里 —— 鼠标移进它时 event.target 是宿主元素，
+        // 用 closest 会「找不到卡片」→ 立刻 hide() → 按钮在鼠标底下消失。
+        // 先认自己的按钮（别藏），再从真实路径里找卡片。
+        const path = event.composedPath();
+        if (path.includes(button)) return;
+        const item = findNoteItem(path);
         if (!item) {
           if (current) hide();
           return;
@@ -814,6 +835,14 @@ class App {
     );
 
     document.addEventListener('mouseout', (event) => {
+      // 指针移向的是我们自己的 UI（快捷按钮、面板）→ 别藏。
+      // relatedTarget 会被重定向成宿主元素，所以比宿主即可。
+      // 不挡这一下的话：鼠标从卡片往按钮走，途经的祖先元素也会冒 mouseout，
+      // 每一层都「不是卡片」→ 按钮在鼠标到达之前就被藏了。
+      const to = event.relatedTarget as Node | null;
+      if (to && (to === this.panel.shadowRoot.host || this.panel.shadowRoot.contains(to))) {
+        return;
+      }
       const target = event.target as HTMLElement | null;
       if (target?.closest('section.note-item, .note-item')) return;
       if (current) hide();
