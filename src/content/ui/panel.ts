@@ -535,6 +535,10 @@ export class Panel {
 
   private renderNoteInner(vm: NoteViewModel): void {
     this.mode = 'note';
+    // 记下这一帧的视图模型。
+    // 少了这一句，进度更新就不知道该补画哪些行（patchProgress 直接 return），
+    // 折叠切换还会把 null 传进 renderNote —— 笔记页的进度条和重试按钮因此永远不刷新。
+    this.lastNoteVm = vm;
     this.toolbar.hidden = false;
     this.footer.hidden = false;
     this.noteRows.clear();
@@ -642,7 +646,10 @@ export class Panel {
     head.addEventListener('click', () => {
       if (this.collapsed.has(key)) this.collapsed.delete(key);
       else this.collapsed.add(key);
-      this.renderNote(this.lastNoteVm!);
+      // 折叠的是这一帧的笔记 —— 没有就说明还没渲染过，点了也没意义
+      const vm = this.lastNoteVm;
+      if (!vm) return;
+      this.renderNote(vm);
     });
     section.appendChild(head);
 
