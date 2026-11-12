@@ -340,3 +340,18 @@ export async function removePack(dirName: string, packName: string): Promise<voi
     /* ignore */
   }
 }
+
+/**
+ * 把整个任务目录删掉。
+ *
+ * 取消时用这个：包里可能有几个已经写好的包，也可能有**没写完的半成品**。
+ * 只按名字删那几个已知的包不够 —— 半成品会一直躺在 OPFS 里。
+ */
+export async function removePackDir(dirName: string): Promise<void> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(dirName, { recursive: true });
+  } catch {
+    /* ignore */
+  }
+}

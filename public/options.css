@@ -1,37 +1,10 @@
+/* 主题变量（颜色、阴影、圆角）不在这里 —— 在 theme.css 里，
+   由 src/shared/palette.json 生成。改配色只改那一个文件。 */
+
+/* 字体栈是扩展页面自己的一套，不跟面板共用 */
 :root {
-  --brand: #ff2442;
-  --brand-press: #e01f3d;
-  --brand-soft: rgba(255, 36, 66, 0.1);
-  --bg-canvas: #ffffff;
-  --bg-raised: #f7f7f9;
-  --bg-sunken: #f0f0f3;
-  --bg-hover: #f2f2f5;
-  --border: #e9e9ee;
-  --border-strong: #d8d8e0;
-  --text-1: #18181c;
-  --text-2: #5e5e69;
-  --text-3: #6b6b76;
-  --success: #0f9d58;
   --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei",
     "Helvetica Neue", Arial, sans-serif;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --brand: #ff4d62;
-    --brand-press: #ff5c6e;
-    --brand-soft: rgba(255, 77, 98, 0.16);
-    --bg-canvas: #1b1b1f;
-    --bg-raised: #242429;
-    --bg-sunken: #2c2c33;
-    --bg-hover: #2a2a30;
-    --border: #34343c;
-    --border-strong: #45454f;
-    --text-1: #f0f0f4;
-    --text-2: #a2a2ae;
-    --text-3: #8e8e9a;
-    --success: #32d583;
-  }
 }
 
 * {

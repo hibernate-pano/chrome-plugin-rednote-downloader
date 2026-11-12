@@ -292,9 +292,12 @@ async function pushHistory(entry: HistoryEntry): Promise<void> {
   const history = await getHistory();
   // 一个任务只占一行：取消之后又重试跑完时，更新原来那行，
   // 而不是再插一行 —— 用户看到的是「这个任务」的最终结果，不是流水账。
+  //
+  // 更新完还把它挪到最前：历史是按「最近一次完成」排的，
+  // 一个老任务重试完了却留在原位不动，用户会以为那是旧的记录。
   const at = history.findIndex((row) => row.taskId === entry.taskId);
-  if (at >= 0) history[at] = entry;
-  else history.unshift(entry);
+  if (at >= 0) history.splice(at, 1);
+  history.unshift(entry);
   await chrome.storage.local.set({ [HISTORY_KEY]: history.slice(0, 50) });
 }
 
@@ -636,9 +639,10 @@ async function startPackDeliveries(
   // 迟到的「包好了」直接丢掉。不然取消了还会再存一个压缩包出来。
   if (!record.running.has('z:pack')) return;
   record.running.delete('z:pack');
-  // 进了交付阶段，队列里那份「待下载清单」就没用了：文件已经在包里，
-  // 接下来只看浏览器那条下载。不清空的话 checkFinished 会一直以为还有活儿，
-  // 空包 / 交付失败这两种收尾永远走不到。
+  // 进了交付阶段，就不该再有待下载的东西了：文件已经在包里，
+  // 接下来只看浏览器那条下载。
+  // （打包模式本来就不用队列，这里清掉是兜底 —— 万一前面有残留，
+  //   checkFinished 会一直以为还有活儿，空包 / 交付失败就永远收不了尾。）
   record.queue = [];
   const started: number[] = [];
   for (const pack of packs) {
@@ -843,6 +847,19 @@ async function poll(): Promise<void> {
       } else if (info.state === 'interrupted') {
         entry.record.running.delete(`d:${info.id}`);
         const error = info.error ?? '保存压缩包时中断了';
+        // 包没能存下来：临时文件留着就是垃圾，让后台页面删掉
+        // （正常交付完是 finishPackTask 去删的，这条路走不到那儿）
+        const files = entry.record.packFiles;
+        if (files) {
+          void chrome.runtime
+            .sendMessage({
+              type: 'ZIP_CLEANUP',
+              taskId: entry.record.taskId,
+              dirName: files.dirName,
+              packNames: files.packNames,
+            })
+            .catch(() => undefined);
+        }
         for (const item of entry.record.items) {
           if (item.state !== 'downloading') continue;
           item.state = 'failed';

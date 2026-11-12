@@ -66,9 +66,15 @@ const stub = {
   settings: {} as Record<string, unknown>,
   /** downloads.download 被调用了几次（判断「有没有真的去起下载」） */
   downloadCalls: 0,
+  /** runtime.sendMessage 收到过什么（用来断言「取消时通知了后台页面」） */
+  sentMessages: [] as Array<{ type?: string }>,
 };
 
 function installChrome(): FakeChrome {
+  // 每个用例都从干净的桩开始 —— 否则上一条用例留下的发信记录和下载历史
+  // 会让「只发了一次」这种断言变成「只发了一次 + 前面那些」。
+  stub.sentMessages.length = 0;
+  stub.settings['rednote.history'] = [];
   // 这些用例测的是「交给浏览器下载」那条路径，
   // 所以把下载方式显式设成 browser（默认是扩展自己写盘）。
   stub.settings['rednote.settings'] = { downloadMode: 'browser' };
@@ -107,6 +113,7 @@ function installChrome(): FakeChrome {
     },
     runtime: {
       sendMessage: async (msg) => {
+        stub.sentMessages.push(msg as { type?: string });
         // 打包模式：后台页面收到 ZIP_START 要立刻回话「收到了」
         if ((msg as { type?: string })?.type === 'ZIP_START') return { ok: true };
         return undefined;
@@ -708,4 +715,149 @@ test('设置迁移：迁移后旧开关不再留在存储里', async () => {
   const mod = await freshDownloader();
   const settings = await mod.getSettings();
   assert.equal('folderByNote' in settings, false);
+});
+
+/* ------------------------------------------------------------------ */
+/* 历史的顺序                                                          */
+/* ------------------------------------------------------------------ */
+
+/** 跑完一个任务：起下载 → 跑完 → 收尾 */
+async function runToCompletion(
+  mod: any,
+  taskId: string,
+  downloadId: number,
+  itemId = 'i1',
+): Promise<void> {
+  stub.nextDownload = [{ ok: true, id: downloadId }];
+  stub.downloads.set(downloadId, {
+    id: downloadId,
+    state: 'in_progress',
+    bytesReceived: 10,
+    totalBytes: 100,
+    filename: `${itemId}.jpg`,
+  });
+  await mod.startDownloads(undefined, taskId, [
+    { itemId, url: 'https://cdn/x.jpg', filename: `${itemId}.jpg`, kind: 'image' },
+  ]);
+  await settle();
+  stub.downloads.set(downloadId, {
+    id: downloadId,
+    state: 'complete',
+    bytesReceived: 100,
+    totalBytes: 100,
+    fileSize: 100,
+    filename: `${itemId}.jpg`,
+  });
+  await settle(900);
+}
+
+test('历史：老任务重试完成后会挪到最前（历史按「最近完成」排）', async () => {
+  installChrome();
+  const mod = await freshDownloader();
+
+  const order = () =>
+    ((stub.settings['rednote.history'] as HistoryRow[] | undefined) ?? []).map(
+      (row) => row.taskId,
+    );
+
+  // task-old：两个文件，一个成功一个失败 —— 这样才有「重试」可点
+  // （重试一个已经完成的项是没有意义的，retryItem 会直接忽略）
+  stub.nextDownload = [
+    { ok: true, id: 71 },
+    { ok: false, error: 'SERVER_BAD_CONTENT' },
+  ];
+  stub.downloads.set(71, {
+    id: 71,
+    state: 'in_progress',
+    bytesReceived: 10,
+    totalBytes: 100,
+    filename: 'i1.jpg',
+  });
+  await mod.startDownloads(undefined, 'task-old', [
+    { itemId: 'i1', url: 'https://cdn/1.jpg', filename: 'i1.jpg', kind: 'image' },
+    { itemId: 'i2', url: 'https://cdn/2.jpg', filename: 'i2.jpg', kind: 'image' },
+  ]);
+  await settle();
+  stub.downloads.set(71, {
+    id: 71,
+    state: 'complete',
+    bytesReceived: 100,
+    totalBytes: 100,
+    fileSize: 100,
+    filename: 'i1.jpg',
+  });
+  await settle(900);
+
+  assert.deepEqual(order(), ['task-old'], 'task-old 收尾（1 成功 1 失败）');
+
+  // 另一个任务跑完 —— 它排在 task-old 前面
+  await runToCompletion(mod, 'task-new', 72);
+  assert.deepEqual(order(), ['task-new', 'task-old'], '两个任务都跑完后，后完成的在前');
+
+  // 回头重试 task-old 里失败的那个文件 —— 完成之后它应该又回到最前
+  stub.nextDownload = [{ ok: true, id: 73 }];
+  await mod.retryItem('task-old', 'i2');
+  await settle();
+  stub.downloads.set(73, {
+    id: 73,
+    state: 'complete',
+    bytesReceived: 100,
+    totalBytes: 100,
+    fileSize: 100,
+    filename: 'i2.jpg',
+  });
+  await settle(900);
+
+  assert.deepEqual(order(), ['task-old', 'task-new'], '重试完成的老任务没有被挪到最前');
+  assert.equal(historyRows('task-old').length, 1, '还是只有一行');
+});
+
+/* ------------------------------------------------------------------ */
+/* 取消时清临时产物                                                    */
+/* ------------------------------------------------------------------ */
+
+test('取消打包任务：要通知后台页面停手（临时包由它清）', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-clean', ZIP_ITEMS);
+  await settle();
+
+  await mod.cancelTask('zip-clean');
+  await settle();
+
+  const types = stub.sentMessages.map((m) => m.type);
+  assert.ok(types.includes('ZIP_CANCEL'), '取消时必须让后台页面停下手里的打包');
+});
+
+test('打包的压缩包存不下来时：要通知后台页面删掉临时包', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-broken', ZIP_ITEMS);
+  await settle();
+
+  // 包写好了，交给浏览器下载
+  stub.nextDownload = [{ ok: true, id: 81 }];
+  stub.downloads.set(81, {
+    id: 81,
+    state: 'in_progress',
+    bytesReceived: 10,
+    totalBytes: 100,
+    filename: 'pack.zip',
+  });
+  await mod.handleOffscreenEvent({ type: 'ZIP_PACKS_READY', taskId: 'zip-broken', packs: [PACK] });
+  await settle();
+
+  // 存到一半失败了
+  stub.downloads.set(81, {
+    id: 81,
+    state: 'interrupted',
+    bytesReceived: 10,
+    totalBytes: 100,
+    error: 'FILE_FAILED',
+    filename: 'pack.zip',
+  });
+  await settle(900);
+
+  const cleanups = stub.sentMessages.filter((m) => m.type === 'ZIP_CLEANUP');
+  assert.equal(cleanups.length, 1, '存失败的包留在 OPFS 里没人清');
 });

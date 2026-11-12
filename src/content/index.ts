@@ -756,8 +756,10 @@ class App {
         });
       }
     } else if (running > 0) {
-      // 任务又开工了（比如点了重试）：下一次完成要重新报
-      taskIds.forEach((id) => this.announced.delete(id));
+      // 任务又开工了（比如点了重试）：下一次完成要重新报。
+      // 只清**本页自己发起**的那些 —— 别的页面同步过来的任务跟本页面无关，
+      // 它们的「已报过」标记不该被这里动。
+      mineIds.forEach((id) => this.announced.delete(id));
     }
   }
 

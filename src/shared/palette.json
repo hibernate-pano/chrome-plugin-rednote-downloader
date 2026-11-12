@@ -1,0 +1,83 @@
+{
+  "_说明": "全扩展主题变量的唯一来源。popup / options / 内容脚本面板三处都从这里取值 —— 以前各写一份，改一次漏两处，对比度就是这么被改坏的。要改配色只改这个文件，然后重新构建。键名就是 CSS 变量名（带 --）。",
+  "light": {
+    "--brand": "#ff2442",
+    "--brand-text": "#d81e38",
+    "--brand-press": "#e01f3d",
+    "--brand-grad": "linear-gradient(135deg, #ff5c72 0%, #ff2442 100%)",
+    "--brand-soft": "rgba(255, 36, 66, 0.1)",
+
+    "--bg-canvas": "#ffffff",
+    "--bg-raised": "#f7f7f9",
+    "--bg-sunken": "#f0f0f3",
+    "--bg-hover": "#f2f2f5",
+    "--bg-active": "#ececf0",
+    "--border": "#e9e9ee",
+    "--border-strong": "#d8d8e0",
+
+    "--text-1": "#18181c",
+    "--text-2": "#5e5e69",
+    "--text-3": "#6b6b76",
+
+    "--success": "#0f9d58",
+    "--success-bg": "#ecfdf3",
+    "--warning": "#b7791f",
+    "--warning-bg": "#fffaeb",
+    "--danger": "#d92d20",
+    "--danger-bg": "#fef3f2",
+
+    "--sh-fab": "0 6px 16px rgba(255, 36, 66, 0.3), 0 2px 4px rgba(20, 20, 30, 0.12)",
+    "--sh-panel": "0 16px 48px rgba(20, 20, 35, 0.18), 0 4px 12px rgba(20, 20, 35, 0.1)",
+    "--sh-card": "0 2px 8px rgba(20, 20, 35, 0.08)",
+    "--sh-card-hov": "0 6px 16px rgba(20, 20, 35, 0.14)",
+    "--sh-pop": "0 8px 24px rgba(20, 20, 35, 0.16)",
+    "--sh-toast": "0 8px 28px rgba(20, 20, 35, 0.2)",
+    "--focus-ring": "rgba(255, 36, 66, 0.3)",
+
+    "--r-xs": "4px",
+    "--r-sm": "6px",
+    "--r-md": "8px",
+    "--r-lg": "12px",
+    "--r-xl": "16px"
+  },
+  "dark": {
+    "--brand": "#ff4d62",
+    "--brand-text": "#ff7a8c",
+    "--brand-press": "#ff5c6e",
+    "--brand-grad": "linear-gradient(135deg, #ff6b7e 0%, #ff3b52 100%)",
+    "--brand-soft": "rgba(255, 77, 98, 0.16)",
+
+    "--bg-canvas": "#1b1b1f",
+    "--bg-raised": "#242429",
+    "--bg-sunken": "#2c2c33",
+    "--bg-hover": "#2a2a30",
+    "--bg-active": "#32323a",
+    "--border": "#34343c",
+    "--border-strong": "#45454f",
+
+    "--text-1": "#f0f0f4",
+    "--text-2": "#a2a2ae",
+    "--text-3": "#8e8e9a",
+
+    "--success": "#32d583",
+    "--success-bg": "#14261d",
+    "--warning": "#fdb022",
+    "--warning-bg": "#2e2413",
+    "--danger": "#f97066",
+    "--danger-bg": "#2a1a1c",
+
+    "--sh-fab": "0 6px 16px rgba(0, 0, 0, 0.45)",
+    "--sh-panel": "0 16px 48px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.4)",
+    "--sh-card": "0 2px 8px rgba(0, 0, 0, 0.35)",
+    "--sh-card-hov": "0 6px 16px rgba(0, 0, 0, 0.5)",
+    "--sh-pop": "0 8px 24px rgba(0, 0, 0, 0.5)",
+    "--sh-toast": "0 8px 28px rgba(0, 0, 0, 0.55)",
+    "--focus-ring": "rgba(255, 77, 98, 0.38)",
+
+    "--r-xs": "4px",
+    "--r-sm": "6px",
+    "--r-md": "8px",
+    "--r-lg": "12px",
+    "--r-xl": "16px"
+  }
+}
