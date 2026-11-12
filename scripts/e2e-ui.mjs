@@ -318,6 +318,11 @@ async function main() {
     const cdp = await connect(page.webSocketDebuggerUrl);
     await cdp.send('Runtime.enable');
     await cdp.send('Page.enable');
+    // 把页面拿到前台并让它认为自己是激活的：
+    // 窗口在后台时 Chrome 会丢掉合成的鼠标按键事件（移动还在，按下没了），
+    // hover 按钮那一段就永远点不动。
+    await cdp.send('Page.bringToFront').catch(() => undefined);
+    await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => undefined);
     // 把下载目录指到临时目录：别往用户真实的「下载」文件夹里丢测试文件
     await cdp.send('Browser.setDownloadBehavior', {
       behavior: 'allow',
@@ -413,6 +418,24 @@ async function main() {
       `state=${before.state} meta=${JSON.stringify(before.meta)}`,
     );
 
+    // 记下这一页弹过的所有提示：提示自己会消失，事后数 DOM 里剩几条会漏
+    await evaluate(`
+      (() => {
+        window.__toastLog = [];
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        const box = sr.querySelector('.rn-toasts');
+        if (!box) return false;
+        new MutationObserver((muts) => {
+          for (const m of muts) {
+            for (const node of m.addedNodes) {
+              if (node.nodeType === 1) window.__toastLog.push(node.textContent || '');
+            }
+          }
+        }).observe(box, { childList: true });
+        return true;
+      })()
+    `);
+
     // 点这一行的下载按钮
     await evaluate(`
       (() => {
@@ -456,6 +479,19 @@ async function main() {
       '底部汇总也跟着刷新',
       /已完成\s*1/.test(rowState?.footerSub || ''),
       `footer=${JSON.stringify(rowState?.footer)} sub=${JSON.stringify(rowState?.footerSub)}`,
+    );
+
+    const toastLog = await evaluate('JSON.stringify(window.__toastLog || [])');
+    let pageToasts = [];
+    try {
+      pageToasts = JSON.parse(String(toastLog));
+    } catch {
+      /* ignore */
+    }
+    check(
+      '完成提示只弹一次',
+      pageToasts.filter((t) => /已保存/.test(String(t))).length === 1,
+      `toasts=${String(toastLog)}`,
     );
 
     /* 失败的那条：要能看到失败，并且有重试按钮 */
@@ -676,6 +712,21 @@ async function main() {
     }
     check('主页上装好了 hover 快捷下载按钮', Boolean(injected));
 
+    // 关掉 UI 的过渡动画：这是在测「按钮能不能点」，不是在测动画。
+    // 自动化窗口可能在后台，合成器不出新帧，动画会停在 .85 缩放上，
+    // 鼠标事件打在上一帧的图上就会点空 —— 跟按钮本身能不能点没关系。
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root')?.shadowRoot;
+        if (!sr || sr.querySelector('style#e2e-no-anim')) return false;
+        const st = document.createElement('style');
+        st.id = 'e2e-no-anim';
+        st.textContent = '.rn-hover-btn { transition: none !important; animation: none !important; }';
+        sr.appendChild(st);
+        return true;
+      })()
+    `);
+
     const hoverState = () =>
       evaluate(`
         (() => {
@@ -729,8 +780,14 @@ async function main() {
     // 点它 → 得有反应
     //
     // 光看 data-show 不够：按钮还得真的能接住鼠标。
-    // 外层 .rn-root 是 pointer-events:none（它盖住整个视口，不这样页面就没法点），
-    // 按钮自己不开 auto 的话，鼠标事件会直接穿透过去 —— 按钮看着在，点了没反应。
+    // 先等缩放动画跑完（.85 缩放时宽度只有 23.8px）：动画没跑完就点，
+    // 命中测试可能还打在上一次「还藏着」的那一帧上。
+    let settledRect = onButton?.rect ?? null;
+    for (let i = 0; i < 30; i += 1) {
+      settledRect = (await hoverState())?.rect ?? settledRect;
+      if (settledRect && settledRect.w >= 27.5) break;
+      await sleep(100);
+    }
     const hit = await evaluate(`
       (() => {
         const sr = document.querySelector('rednote-root')?.shadowRoot;
@@ -754,7 +811,7 @@ async function main() {
     `);
     // 按「按钮此刻的位置」点：真人也是看着当前的位置点的。
     // 用几帧之前量到的坐标会因为缩放动画/布局微调点空。
-    const clickAt = (await hoverState())?.rect ?? onButton.rect;
+    const clickAt = (await hoverState())?.rect ?? settledRect ?? onButton.rect;
     await cdp.send('Input.dispatchMouseEvent', {
       type: 'mouseMoved',
       x: clickAt.x,
@@ -767,6 +824,7 @@ async function main() {
       x: clickAt.x,
       y: clickAt.y,
       button: 'left',
+      buttons: 1,
       clickCount: 1,
     });
     await cdp.send('Input.dispatchMouseEvent', {
@@ -774,6 +832,7 @@ async function main() {
       x: clickAt.x,
       y: clickAt.y,
       button: 'left',
+      buttons: 0,
       clickCount: 1,
     });
     // 点击处理的第一步就是 hide()：按钮被藏了说明事件确实送到了它手上。
@@ -783,6 +842,7 @@ async function main() {
       document.querySelector('rednote-root')?.shadowRoot?.querySelector('.rn-hover-btn')?.dataset.show ?? null
     `);
     check('点击事件送达到了按钮（按钮随即收起）', hiddenAfterClick === 'false', `data-show=${hiddenAfterClick}`);
+
 
     // 提示有时限（成功提示 3.2s 后自动消失），只等一次容易正好错过 ——
     // 每 200ms 看一次，看到新提示就收工。
@@ -802,6 +862,11 @@ async function main() {
       '点按钮真的触发了下载（出现新的提示）',
       toastsAfter > toastsBefore && /已保存|已开始|解析|下载/.test(String(toast)),
       `before=${toastsBefore} after=${toastsAfter} toast=${String(toast)}`,
+    );
+    check(
+      '完成提示只弹一次（主页快捷下载）',
+      String(toast).split(' | ').filter((t) => /已保存/.test(t)).length === 1,
+      `toast=${String(toast)}`,
     );
   } finally {
     cleanup();

@@ -290,7 +290,11 @@ export async function getHistory(): Promise<HistoryEntry[]> {
 
 async function pushHistory(entry: HistoryEntry): Promise<void> {
   const history = await getHistory();
-  history.unshift(entry);
+  // 一个任务只占一行：取消之后又重试跑完时，更新原来那行，
+  // 而不是再插一行 —— 用户看到的是「这个任务」的最终结果，不是流水账。
+  const at = history.findIndex((row) => row.taskId === entry.taskId);
+  if (at >= 0) history[at] = entry;
+  else history.unshift(entry);
   await chrome.storage.local.set({ [HISTORY_KEY]: history.slice(0, 50) });
 }
 
@@ -1015,6 +1019,10 @@ export function attachDownloadListeners(): void {
 /* ------------------------------------------------------------------ */
 
 async function checkFinished(record: TaskRecord): Promise<void> {
+  // 已经收过尾了就直接回去。
+  // pump 和 poll 完成一个下载时各会调一次这里 —— 不挡的话，
+  // 同一个任务会写两条历史、弹两次「已保存」。
+  if (record.summary.finishedAt) return;
   if (record.running.size > 0 || record.queue.length > 0) return;
   const allDone = record.items.every(
     (i) => i.state === 'completed' || i.state === 'failed' || i.state === 'cancelled',
@@ -1108,6 +1116,9 @@ export async function retryItem(taskId: string, itemId: string): Promise<StartRe
   item.downloadId = undefined;
   item.totalBytes = source.size ?? -1;
   record.summary.failed = Math.max(0, record.summary.failed - 1);
+  // 重新开工了：把上一次的收尾时间清掉，否则 checkFinished 会当它已经结束，
+  // 这一轮跑完既不会更新 finishAt，也不会更新历史
+  record.summary.finishedAt = undefined;
   record.dirty.add(itemId);
 
   if (record.engine === 'zip') {

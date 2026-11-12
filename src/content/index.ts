@@ -628,6 +628,15 @@ class App {
 
   private progressMap = new Map<string, DownloadProgress>();
 
+  /**
+   * 已经报过「完成」的任务。
+   *
+   * 一个任务结束时会连着收到好几条进度广播（完成一条 → 收尾 → 全量再同步一次），
+   * 每条都是「全部结束」的状态。不记一下的话，用户会看到两三条一模一样的
+   * 「已保存 N 个文件」。任务重新开工（重试）时把它从集合里去掉，下次完成再报。
+   */
+  private announced = new Set<string>();
+
   private async startDownload(items: MediaItem[]): Promise<void> {
     if (items.length === 0) return;
     // 文件类型筛选在这里兜底：所有入口（面板按钮、主页悬停按钮）都走这一条路
@@ -692,8 +701,6 @@ class App {
     }
 
     const all = [...this.progressMap.values()];
-    const completed = all.filter((p) => p.state === 'completed').length;
-    const failed = all.filter((p) => p.state === 'failed').length;
     const running = all.filter(
       (p) =>
         p.state === 'downloading' ||
@@ -713,18 +720,44 @@ class App {
     // 整块重画会把几十张卡片的缩略图反复重建，主线程会明显卡顿
     this.panel.patchProgress(list);
 
+    const taskIds = new Set(all.map((p) => String(p.taskId)));
+    // 这个页面自己发起的任务（别的页面发起的，状态也会同步过来，只是不归我们报）
+    const mineIds = new Set(
+      [this.noteTaskId, this.batchTaskId].filter((id): id is string => Boolean(id)),
+    );
+
     if (running === 0 && total > 0 && settled === total) {
       this.panel.setFabBackgroundProgress(null);
-      if (failed === 0) {
+      // 同一批进度会重复广播（完成一条 → 收尾 → 全量再同步一次），
+      // 每条都是「全部结束」。同一个任务只报一次。
+      //
+      // 而且只报**这个页面自己发起的**任务：换到新页面后，后台还会把
+      // 之前那些任务的状态同步过来（面板要能显示「已保存」），但它们早就
+      // 报过了 —— 再弹一次就是用户看到的「下载完了弹两遍」。
+      const mine = [...taskIds].some((id) => mineIds.has(id));
+      const fresh = [...taskIds].some((id) => !this.announced.has(id));
+      if (!mine || !fresh) return;
+      taskIds.forEach((id) => this.announced.add(id));
+
+      // 数数只数自己的任务：同步过来的旧任务里可能有失败项，
+      // 混进来会把「保存好了」说成「下载失败」
+      const own = all.filter((p) => mineIds.has(String(p.taskId)));
+      const done = own.filter((p) => p.state === 'completed').length;
+      const bad = own.filter((p) => p.state === 'failed').length;
+
+      if (bad === 0) {
         // 全部取消 / 一个都没下成的时候不能报「已保存 0 个文件」——
         // 那是句假话，还会让人以为取消没生效。没存下东西就不报喜。
-        if (completed > 0) this.toast.success(`已保存 ${completed} 个文件`);
+        if (done > 0) this.toast.success(`已保存 ${done} 个文件`);
       } else {
-        this.toast.error(`${failed} 个文件下载失败`, '点击可在面板中重试', {
+        this.toast.error(`${bad} 个文件下载失败`, '点击可在面板中重试', {
           label: '查看',
           onClick: () => this.panel.open(),
         });
       }
+    } else if (running > 0) {
+      // 任务又开工了（比如点了重试）：下一次完成要重新报
+      taskIds.forEach((id) => this.announced.delete(id));
     }
   }
 

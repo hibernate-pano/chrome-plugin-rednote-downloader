@@ -572,6 +572,109 @@ test('打包：取消之后落到终态，迟到的「包好了」也不会再�
 });
 
 /* ------------------------------------------------------------------ */
+/* 收尾的幂等性                                                          */
+/* ------------------------------------------------------------------ */
+
+type HistoryRow = { taskId: string; completed: number; finishedAt: number };
+
+function historyRows(taskId: string): HistoryRow[] {
+  const all = (stub.settings['rednote.history'] as HistoryRow[] | undefined) ?? [];
+  return all.filter((row) => row.taskId === taskId);
+}
+
+/** 记录发给页面的 TASK_SUMMARY，用来数「弹了几次完成」 */
+function captureSummaries(): Array<{ type: string }> {
+  const seen: Array<{ type: string }> = [];
+  (globalThis as any).chrome.tabs.sendMessage = async (
+    _tabId: number,
+    msg: { type?: string },
+  ) => {
+    if (msg?.type === 'TASK_SUMMARY') seen.push(msg as { type: string });
+  };
+  return seen;
+}
+
+test('收尾：同一任务只写一条历史、只发一次 TASK_SUMMARY', async () => {
+  installChrome();
+  const mod = await freshDownloader();
+  const summaries = captureSummaries();
+  stub.nextDownload = [{ ok: true, id: 41 }];
+  stub.downloads.set(41, {
+    id: 41,
+    state: 'in_progress',
+    bytesReceived: 10,
+    totalBytes: 100,
+    filename: '1.jpg',
+  });
+
+  await mod.startDownloads(7, 'task-10', [
+    { itemId: 'i1', url: 'https://cdn/x.jpg', filename: '1.jpg', kind: 'image' },
+  ]);
+  await settle();
+
+  stub.downloads.set(41, {
+    id: 41,
+    state: 'complete',
+    bytesReceived: 100,
+    totalBytes: 100,
+    fileSize: 100,
+    filename: '1.jpg',
+  });
+  // poll 完成后会依次走 pump 和自身两条收尾路径 —— 只能记一次
+  await settle(900);
+
+  assert.equal(historyRows('task-10').length, 1, '同一个任务写了多条下载历史');
+  assert.equal(summaries.length, 1, '完成提示发了不止一次');
+});
+
+test('收尾：取消后重试再完成，历史还是那一条（不会多出一条）', async () => {
+  installChrome();
+  const mod = await freshDownloader();
+  stub.nextDownload = [{ ok: true, id: 51 }];
+  stub.downloads.set(51, {
+    id: 51,
+    state: 'in_progress',
+    bytesReceived: 0,
+    totalBytes: 100,
+    filename: '1.jpg',
+  });
+
+  await mod.startDownloads(undefined, 'task-11', [
+    { itemId: 'i1', url: 'https://cdn/x.jpg', filename: '1.jpg', kind: 'image' },
+  ]);
+  await settle();
+
+  await mod.cancelTask('task-11');
+  assert.equal(historyRows('task-11').length, 1, '取消时应该已经写了一条历史');
+
+  // 用户点了重试，这次下载成功
+  stub.nextDownload = [{ ok: true, id: 52 }];
+  stub.downloads.set(52, {
+    id: 52,
+    state: 'in_progress',
+    bytesReceived: 0,
+    totalBytes: 100,
+    filename: '1.jpg',
+  });
+  await mod.retryItem('task-11', 'i1');
+  await settle();
+  stub.downloads.set(52, {
+    id: 52,
+    state: 'complete',
+    bytesReceived: 100,
+    totalBytes: 100,
+    fileSize: 100,
+    filename: '1.jpg',
+  });
+  await settle(900);
+
+  const rows = historyRows('task-11');
+  assert.equal(rows.length, 1, '重试完成之后又插了一条历史');
+  assert.equal(rows[0]?.completed, 1, '历史里的完成数没有跟着更新');
+  assert.equal(mod.getTaskSnapshot('task-11')?.items[0]?.state, 'completed');
+});
+
+/* ------------------------------------------------------------------ */
 /* 旧设置迁移                                                            */
 /* ------------------------------------------------------------------ */
 
