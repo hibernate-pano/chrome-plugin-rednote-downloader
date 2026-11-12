@@ -716,7 +716,9 @@ class App {
     if (running === 0 && total > 0 && settled === total) {
       this.panel.setFabBackgroundProgress(null);
       if (failed === 0) {
-        this.toast.success(`已保存 ${completed} 个文件`);
+        // 全部取消 / 一个都没下成的时候不能报「已保存 0 个文件」——
+        // 那是句假话，还会让人以为取消没生效。没存下东西就不报喜。
+        if (completed > 0) this.toast.success(`已保存 ${completed} 个文件`);
       } else {
         this.toast.error(`${failed} 个文件下载失败`, '点击可在面板中重试', {
           label: '查看',

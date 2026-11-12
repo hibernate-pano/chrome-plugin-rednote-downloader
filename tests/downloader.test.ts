@@ -385,6 +385,91 @@ test('SW 重启：浏览器还在下载的项保持「下载中」，不会被�
 });
 
 /* ------------------------------------------------------------------ */
+/* 取消                                                                */
+/* ------------------------------------------------------------------ */
+
+test('取消：正在下载的条目也落到 cancelled，任务不会卡在「下载中」', async () => {
+  installChrome();
+  const mod = await freshDownloader();
+  // 默认并发 3：四个文件里三个在下载、一个还在排队
+  stub.nextDownload = [
+    { ok: true, id: 21 },
+    { ok: true, id: 22 },
+    { ok: true, id: 23 },
+  ];
+  for (const id of [21, 22, 23]) {
+    stub.downloads.set(id, {
+      id,
+      state: 'in_progress',
+      bytesReceived: 10,
+      totalBytes: 100,
+      filename: `${id}.jpg`,
+    });
+  }
+
+  await mod.startDownloads(undefined, 'task-8', [
+    { itemId: 'i1', url: 'https://cdn/1.jpg', filename: '1.jpg', kind: 'image' },
+    { itemId: 'i2', url: 'https://cdn/2.jpg', filename: '2.jpg', kind: 'image' },
+    { itemId: 'i3', url: 'https://cdn/3.jpg', filename: '3.jpg', kind: 'image' },
+    { itemId: 'i4', url: 'https://cdn/4.jpg', filename: '4.jpg', kind: 'image' },
+  ]);
+  await settle();
+
+  // 三个正在下、一个还在排队 —— 这时候点取消
+  const before = mod.getTaskSnapshot('task-8');
+  assert.deepEqual(
+    before?.items.map((i) => i.state),
+    ['downloading', 'downloading', 'downloading', 'queued'],
+    '前提：三个在下载、一个在排队',
+  );
+
+  await mod.cancelTask('task-8');
+
+  const snap = mod.getTaskSnapshot('task-8');
+  assert.deepEqual(
+    snap?.items.map((i) => i.state),
+    ['cancelled', 'cancelled', 'cancelled', 'cancelled'],
+    '取消之后不能有任何条目还停在 downloading / queued',
+  );
+  assert.equal(snap?.summary.failed, 0, '用户自己取消的不算失败');
+  assert.ok(snap?.summary.finishedAt, '取消也是一次收尾，finishedAt 必须写上');
+});
+
+test('取消：正在下载的条目取消后不会再被浏览器事件改回 completed', async () => {
+  installChrome();
+  const mod = await freshDownloader();
+  stub.nextDownload = [{ ok: true, id: 31 }];
+  stub.downloads.set(31, {
+    id: 31,
+    state: 'in_progress',
+    bytesReceived: 50,
+    totalBytes: 100,
+    filename: '1.jpg',
+  });
+
+  await mod.startDownloads(undefined, 'task-9', [
+    { itemId: 'i1', url: 'https://cdn/x.jpg', filename: '1.jpg', kind: 'image' },
+  ]);
+  await settle();
+  await mod.cancelTask('task-9');
+
+  // 浏览器那边慢半拍：取消之后才把这条报成完成
+  stub.downloads.set(31, {
+    id: 31,
+    state: 'complete',
+    bytesReceived: 100,
+    totalBytes: 100,
+    fileSize: 100,
+    filename: '1.jpg',
+  });
+  await settle(700);
+
+  const snap = mod.getTaskSnapshot('task-9');
+  assert.equal(snap?.items[0]?.state, 'cancelled', '取消之后不该被改回「已完成」');
+  assert.equal(snap?.summary.completed, 0);
+});
+
+/* ------------------------------------------------------------------ */
 /* 旧设置迁移                                                            */
 /* ------------------------------------------------------------------ */
 

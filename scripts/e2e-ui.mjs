@@ -14,6 +14,7 @@
  * 运行：node build.mjs && node scripts/e2e-ui.mjs
  */
 import { spawn, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -24,7 +25,7 @@ import { notePageHtml, serializeState } from './fake-site.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'dist');
-const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-e2e-ui-'));
+const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rednote-e2e-ui-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const CHROME_CANDIDATES = [
@@ -324,6 +325,24 @@ async function main() {
       eventsEnabled: false,
     });
 
+    // 连上 Service Worker：任务终态要到它自己的存储里核对，页面里看不到
+    const hex = createHash('sha256').update(fs.realpathSync(testDist)).digest('hex').slice(0, 32);
+    let extId = '';
+    for (const c of hex) extId += String.fromCharCode(97 + parseInt(c, 16));
+    let sw = null;
+    for (let i = 0; i < 30 && !sw; i += 1) {
+      const list = await (await fetch(`http://127.0.0.1:${port + 500}/json/list`)).json();
+      const target = list.find(
+        (t) => t.type === 'service_worker' && t.url.startsWith(`chrome-extension://${extId}/`),
+      );
+      if (target) {
+        sw = await connect(target.webSocketDebuggerUrl);
+        await sw.send('Runtime.enable');
+        break;
+      }
+      await sleep(300);
+    }
+
     const logs = [];
     cdp.on((msg) => {
       if (msg.method === 'Runtime.exceptionThrown') {
@@ -508,6 +527,136 @@ async function main() {
       collapse?.ok && collapse?.rowsBack >= 1,
       JSON.stringify(collapse),
     );
+
+    /* ================================================================ */
+    /* 问题 6：下载中要有取消入口，取消后任务落到终态                     */
+    /* ================================================================ */
+    console.log('\n▶ 问题 6：取消下载');
+
+    await cdp.send('Page.navigate', { url: `${origin}/explore/mocknote0003` });
+    await waitForRows(1);
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        sr.querySelector('.rn-fab').click();
+        return true;
+      })()
+    `);
+    await sleep(600);
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        sr.querySelector('.rn-row .rn-btn').click();
+        return true;
+      })()
+    `);
+
+    // 等它真的开始下载（慢速媒体，能稳定停在 downloading）
+    let during = null;
+    for (let i = 0; i < 40; i += 1) {
+      during = await evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root').shadowRoot;
+          const row = sr.querySelector('.rn-row');
+          return {
+            state: row?.dataset.state ?? null,
+            cancel: [...sr.querySelectorAll('.rn-footer .rn-btn')]
+              .map((b) => b.textContent.trim())
+              .find((t) => t === '取消') ?? null,
+          };
+        })()
+      `);
+      if (during?.state === 'downloading' && during?.cancel) break;
+      await sleep(200);
+    }
+    check('下载中行状态是 downloading', during?.state === 'downloading', `state=${during?.state}`);
+    check('下载中面板上有「取消」按钮', during?.cancel === '取消', `buttons=${JSON.stringify(during)}`);
+
+    // 点取消
+    await evaluate(`
+      (() => {
+        const sr = document.querySelector('rednote-root').shadowRoot;
+        const btn = [...sr.querySelectorAll('.rn-footer .rn-btn')]
+          .find((b) => b.textContent.trim() === '取消');
+        if (!btn) throw new Error('找不到取消按钮');
+        btn.click();
+        return true;
+      })()
+    `);
+
+    let afterCancel = null;
+    for (let i = 0; i < 40; i += 1) {
+      afterCancel = await evaluate(`
+        (() => {
+          const sr = document.querySelector('rednote-root').shadowRoot;
+          const row = sr.querySelector('.rn-row');
+          return {
+            state: row?.dataset.state ?? null,
+            meta: row?.querySelector('.rn-row-meta')?.textContent || '',
+            action: (row?.querySelector('.rn-row-action')?.textContent || '').trim(),
+            footer: sr.querySelector('.rn-footer-title')?.textContent || '',
+            cancel: [...sr.querySelectorAll('.rn-footer .rn-btn')]
+              .some((b) => b.textContent.trim() === '取消'),
+          };
+        })()
+      `);
+      if (afterCancel?.state === 'cancelled') break;
+      await sleep(250);
+    }
+    check(
+      '取消后行落到 cancelled（不是一直 downloading）',
+      afterCancel?.state === 'cancelled',
+      `state=${afterCancel?.state} meta=${JSON.stringify(afterCancel?.meta)}`,
+    );
+    check('取消后行上写「已取消」', /已取消/.test(afterCancel?.meta || ''), `meta=${JSON.stringify(afterCancel?.meta)}`);
+    check(
+      '取消后不再显示取消按钮（任务已经收尾）',
+      afterCancel?.cancel === false,
+      `footer=${JSON.stringify(afterCancel?.footer)}`,
+    );
+    check('取消后可以重试（不是死路）', /重试/.test(afterCancel?.action || ''), `action=${JSON.stringify(afterCancel?.action)}`);
+
+    // 取消不该被当成「跑完了」：一个都没存下来，就不能弹出「已保存 0 个文件」
+    await sleep(500);
+    const cancelToast = await evaluate(`
+      [...document.querySelector('rednote-root')?.shadowRoot?.querySelectorAll('.rn-toast') ?? []]
+        .map((t) => t.textContent).join(' | ')
+    `);
+    check(
+      '取消后不报「已保存 0 个文件」',
+      !/已保存\s*0\s*个/.test(String(cancelToast)),
+      `toasts=${JSON.stringify(cancelToast)}`,
+    );
+
+    /* 任务真的收尾了：Service Worker 里的快照要有 finishedAt */
+    if (sw) {
+      const snapshot = await sw
+        .eval(`
+          (async () => {
+            const raw = await chrome.storage.session.get('rednote.download.tasks');
+            const list = raw['rednote.download.tasks'] || [];
+            const t = list[list.length - 1];
+            return JSON.stringify({
+              states: (t?.items || []).map((i) => i.state),
+              finishedAt: t?.summary?.finishedAt ?? null,
+            });
+          })()
+        `)
+        .catch(() => '');
+      let parsed = {};
+      try {
+        parsed = JSON.parse(String(snapshot));
+      } catch {
+        /* ignore */
+      }
+      check(
+        '取消后任务写上了終态时间（finishedAt）',
+        Boolean(parsed.finishedAt),
+        `snapshot=${String(snapshot)}`,
+      );
+    } else {
+      check('取消后任务写上了終态时间（finishedAt）', false, '没连上 Service Worker');
+    }
 
     /* ================================================================ */
     /* 问题 5：主页 hover 出来的快捷下载按钮要能点                        */

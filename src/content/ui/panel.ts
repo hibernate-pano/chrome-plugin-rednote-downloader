@@ -157,6 +157,10 @@ function rowStatusHtml(item: MediaItem, progress?: DownloadProgress): string {
   if (state === 'failed') {
     return `<span class="rn-err">下载失败</span>${progress?.error ? ` · ${progress.error}` : ''}`;
   }
+  if (state === 'cancelled') {
+    // 用户自己停的：别写成「失败」，那会让人以为出错了
+    return '<span class="rn-retrying">已取消</span>';
+  }
   if (item.isStream) {
     return '<span class="rn-err">HLS 流</span> · 暂不支持直接保存';
   }
@@ -776,7 +780,8 @@ export class Panel {
       btn.innerHTML = icon('folder', 15);
       btn.addEventListener('click', () => this.callbacks.onOpenDownloads());
       action.appendChild(btn);
-    } else if (state === 'failed') {
+    } else if (state === 'failed' || state === 'cancelled') {
+      // 取消过的条目也要能重来 —— 不然用户点了取消就再也没有入口了
       const btn = el('button', 'rn-btn');
       btn.type = 'button';
       btn.dataset.variant = 'text';
@@ -921,6 +926,17 @@ export class Panel {
       info.append(title, sub);
     }
     this.footer.appendChild(info);
+
+    // 下载中给一个能点到的出口：否则用户只能等它跑完（或者关掉页面）
+    if (active.length > 0) {
+      const cancel = el('button', 'rn-btn');
+      cancel.type = 'button';
+      cancel.dataset.variant = 'text';
+      cancel.setAttribute('aria-label', '取消这个下载任务');
+      cancel.innerHTML = `${icon('close', 14)}取消`;
+      cancel.addEventListener('click', () => this.callbacks.onCancelTask());
+      this.footer.appendChild(cancel);
+    }
 
     const copyBtn = el('button', 'rn-btn');
     copyBtn.type = 'button';
@@ -1516,6 +1532,17 @@ export class Panel {
       info.appendChild(bar);
     }
     this.footer.appendChild(info);
+
+    // 批量下载进行中：给一个取消入口（跟笔记页同一处位置、同一个说法）
+    if (runningCount > 0 || queueCount > 0) {
+      const cancel = el('button', 'rn-btn');
+      cancel.type = 'button';
+      cancel.dataset.variant = 'text';
+      cancel.setAttribute('aria-label', '取消这个下载任务');
+      cancel.innerHTML = `${icon('close', 14)}取消`;
+      cancel.addEventListener('click', () => this.callbacks.onCancelTask());
+      this.footer.appendChild(cancel);
+    }
 
     if (selectedCards.length > 0) {
       const clear = el('button', 'rn-btn');

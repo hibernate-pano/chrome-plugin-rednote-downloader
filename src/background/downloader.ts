@@ -1027,27 +1027,41 @@ export async function cancelTask(taskId: string): Promise<void> {
   const record = tasks.get(taskId);
   if (!record) return;
 
-  if (record.engine === 'zip') {
-    // 打包模式：让后台页面停下，同时把已经开始的那次下载也停掉
-    void chrome.runtime.sendMessage({ type: 'ZIP_CANCEL', taskId }).catch(() => undefined);
-    for (const key of record.running.keys()) {
-      if (!key.startsWith('d:')) continue;
-      await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
-    }
-  } else {
-    for (const key of record.running.keys()) {
-      if (!key.startsWith('d:')) continue;
-      await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
-    }
-  }
-
+  // 先在内存里把任务落成终态，再去停浏览器那边的下载。
+  //
+  // 顺序很关键：chrome.downloads.cancel 会触发 onChanged → poll，
+  // 如果那时条目还挂在 running / downloading，poll 会把它当「中断」处理
+  // （还可能报成失败、算错统计数）。先把状态钉死，后面来什么都改不回去。
+  // running 里的打包占位项（z:pack）也要一起清 —— 留着它 running 就永远不为空，
+  // checkFinished 永远不满足，任务会一直挂在「下载中」。
+  const runningDownloads = [...record.running.keys()].filter((key) => key.startsWith('d:'));
+  // 取消是整个任务的意思：还在排队和**已经在下载**的都要落成 cancelled。
+  // 只清 queued/waiting 的话，正在下的那几条会卡在 downloading ——
+  // 取消之后界面还在转圈，看不出取消到底有没有生效。
   record.queue = [];
+  record.running.clear();
   record.items.forEach((item) => {
-    if (item.state === 'queued' || item.state === 'waiting') {
+    if (
+      item.state === 'queued' ||
+      item.state === 'waiting' ||
+      item.state === 'downloading' ||
+      item.state === 'retrying'
+    ) {
       item.state = 'cancelled';
+      item.speed = undefined;
+      item.error = undefined;
       record.dirty.add(item.itemId);
     }
   });
+  if (record.engine === 'zip') {
+    // 打包那一路的活儿在后台页面里跑，没有浏览器下载 id 可停
+    void chrome.runtime.sendMessage({ type: 'ZIP_CANCEL', taskId }).catch(() => undefined);
+  }
+  // 交给浏览器的下载，才是真正还在走网络的
+  for (const key of runningDownloads) {
+    await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
+  }
+
   await persist();
   await broadcast(record, true);
   await checkFinished(record);
