@@ -1,6 +1,6 @@
 {
   "name": "rednote-downloader",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "private": true,
   "description": "小红书内容下载器 — Chrome 扩展",
   "type": "module",
@@ -12,6 +12,7 @@
     "pretest": "esbuild tests/core.test.ts --bundle --format=esm --platform=node --outfile=build/test/core.test.mjs --log-level=error && esbuild tests/downloader.test.ts --bundle --format=esm --platform=node --outfile=build/test/downloader.test.mjs --log-level=error && esbuild tests/zip.test.ts --bundle --format=esm --platform=node --outfile=build/test/zip.test.mjs --log-level=error && esbuild tests/pack.test.ts --bundle --format=esm --platform=node --outfile=build/test/pack.test.mjs --log-level=error && esbuild src/background/downloader.ts --bundle --format=esm --platform=node --outfile=build/test/_downloader.mjs --log-level=error",
     "test": "node --test \"build/test/*.test.mjs\"",
     "check:palette": "node build.mjs && node scripts/check-palette.mjs",
+    "release:zip": "node build.mjs && node scripts/make-zip.mjs",
     "e2e": "node build.mjs && node scripts/e2e-ui.mjs && node scripts/e2e.mjs && node scripts/e2e-batch.mjs && node scripts/e2e-zip.mjs",
     "e2e:ui": "node build.mjs && node scripts/e2e-ui.mjs",
     "e2e:batch": "node build.mjs && node scripts/e2e-batch.mjs",
