@@ -290,6 +290,13 @@ export async function getHistory(): Promise<HistoryEntry[]> {
 
 async function pushHistory(entry: HistoryEntry): Promise<void> {
   const history = await getHistory();
+  // 一个任务只占一行：取消之后又重试跑完时，更新原来那行，
+  // 而不是再插一行 —— 用户看到的是「这个任务」的最终结果，不是流水账。
+  //
+  // 更新完还把它挪到最前：历史是按「最近一次完成」排的，
+  // 一个老任务重试完了却留在原位不动，用户会以为那是旧的记录。
+  const at = history.findIndex((row) => row.taskId === entry.taskId);
+  if (at >= 0) history.splice(at, 1);
   history.unshift(entry);
   await chrome.storage.local.set({ [HISTORY_KEY]: history.slice(0, 50) });
 }
@@ -628,7 +635,15 @@ async function startPackDeliveries(
   record: TaskRecord,
   packs: { dirName: string; name: string; objectUrl: string; downloadPath: string }[],
 ): Promise<void> {
+  // 打包阶段已经不在跑了（用户取消了，或者这一批已经交付过）：
+  // 迟到的「包好了」直接丢掉。不然取消了还会再存一个压缩包出来。
+  if (!record.running.has('z:pack')) return;
   record.running.delete('z:pack');
+  // 进了交付阶段，就不该再有待下载的东西了：文件已经在包里，
+  // 接下来只看浏览器那条下载。
+  // （打包模式本来就不用队列，这里清掉是兜底 —— 万一前面有残留，
+  //   checkFinished 会一直以为还有活儿，空包 / 交付失败就永远收不了尾。）
+  record.queue = [];
   const started: number[] = [];
   for (const pack of packs) {
     try {
@@ -660,6 +675,22 @@ async function startPackDeliveries(
   await persist();
   await broadcast(record, true);
   ensureHeartbeat();
+
+  if (started.length === 0) {
+    // 一个包都没交出去（空包，或者交付时全失败）：后面不会再有浏览器下载
+    // 事件来触发收尾，这里必须自己确认终态 —— 否则任务永远停在「下载中」。
+    if (packs.length > 0) {
+      void chrome.runtime
+        .sendMessage({
+          type: 'ZIP_CLEANUP',
+          taskId: record.taskId,
+          dirName: packs[0]?.dirName ?? '',
+          packNames: packs.map((pack) => pack.name),
+        })
+        .catch(() => undefined);
+    }
+    await checkFinished(record);
+  }
 }
 
 /**
@@ -816,6 +847,19 @@ async function poll(): Promise<void> {
       } else if (info.state === 'interrupted') {
         entry.record.running.delete(`d:${info.id}`);
         const error = info.error ?? '保存压缩包时中断了';
+        // 包没能存下来：临时文件留着就是垃圾，让后台页面删掉
+        // （正常交付完是 finishPackTask 去删的，这条路走不到那儿）
+        const files = entry.record.packFiles;
+        if (files) {
+          void chrome.runtime
+            .sendMessage({
+              type: 'ZIP_CLEANUP',
+              taskId: entry.record.taskId,
+              dirName: files.dirName,
+              packNames: files.packNames,
+            })
+            .catch(() => undefined);
+        }
         for (const item of entry.record.items) {
           if (item.state !== 'downloading') continue;
           item.state = 'failed';
@@ -992,6 +1036,10 @@ export function attachDownloadListeners(): void {
 /* ------------------------------------------------------------------ */
 
 async function checkFinished(record: TaskRecord): Promise<void> {
+  // 已经收过尾了就直接回去。
+  // pump 和 poll 完成一个下载时各会调一次这里 —— 不挡的话，
+  // 同一个任务会写两条历史、弹两次「已保存」。
+  if (record.summary.finishedAt) return;
   if (record.running.size > 0 || record.queue.length > 0) return;
   const allDone = record.items.every(
     (i) => i.state === 'completed' || i.state === 'failed' || i.state === 'cancelled',
@@ -1027,27 +1075,41 @@ export async function cancelTask(taskId: string): Promise<void> {
   const record = tasks.get(taskId);
   if (!record) return;
 
-  if (record.engine === 'zip') {
-    // 打包模式：让后台页面停下，同时把已经开始的那次下载也停掉
-    void chrome.runtime.sendMessage({ type: 'ZIP_CANCEL', taskId }).catch(() => undefined);
-    for (const key of record.running.keys()) {
-      if (!key.startsWith('d:')) continue;
-      await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
-    }
-  } else {
-    for (const key of record.running.keys()) {
-      if (!key.startsWith('d:')) continue;
-      await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
-    }
-  }
-
+  // 先在内存里把任务落成终态，再去停浏览器那边的下载。
+  //
+  // 顺序很关键：chrome.downloads.cancel 会触发 onChanged → poll，
+  // 如果那时条目还挂在 running / downloading，poll 会把它当「中断」处理
+  // （还可能报成失败、算错统计数）。先把状态钉死，后面来什么都改不回去。
+  // running 里的打包占位项（z:pack）也要一起清 —— 留着它 running 就永远不为空，
+  // checkFinished 永远不满足，任务会一直挂在「下载中」。
+  const runningDownloads = [...record.running.keys()].filter((key) => key.startsWith('d:'));
+  // 取消是整个任务的意思：还在排队和**已经在下载**的都要落成 cancelled。
+  // 只清 queued/waiting 的话，正在下的那几条会卡在 downloading ——
+  // 取消之后界面还在转圈，看不出取消到底有没有生效。
   record.queue = [];
+  record.running.clear();
   record.items.forEach((item) => {
-    if (item.state === 'queued' || item.state === 'waiting') {
+    if (
+      item.state === 'queued' ||
+      item.state === 'waiting' ||
+      item.state === 'downloading' ||
+      item.state === 'retrying'
+    ) {
       item.state = 'cancelled';
+      item.speed = undefined;
+      item.error = undefined;
       record.dirty.add(item.itemId);
     }
   });
+  if (record.engine === 'zip') {
+    // 打包那一路的活儿在后台页面里跑，没有浏览器下载 id 可停
+    void chrome.runtime.sendMessage({ type: 'ZIP_CANCEL', taskId }).catch(() => undefined);
+  }
+  // 交给浏览器的下载，才是真正还在走网络的
+  for (const key of runningDownloads) {
+    await chrome.downloads.cancel(Number(key.slice(2))).catch(() => undefined);
+  }
+
   await persist();
   await broadcast(record, true);
   await checkFinished(record);
@@ -1071,6 +1133,9 @@ export async function retryItem(taskId: string, itemId: string): Promise<StartRe
   item.downloadId = undefined;
   item.totalBytes = source.size ?? -1;
   record.summary.failed = Math.max(0, record.summary.failed - 1);
+  // 重新开工了：把上一次的收尾时间清掉，否则 checkFinished 会当它已经结束，
+  // 这一轮跑完既不会更新 finishAt，也不会更新历史
+  record.summary.finishedAt = undefined;
   record.dirty.add(itemId);
 
   if (record.engine === 'zip') {

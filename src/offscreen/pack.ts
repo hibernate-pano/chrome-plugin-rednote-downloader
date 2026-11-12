@@ -158,7 +158,14 @@ class OrderedQueue<T> {
 
 interface Downloaded {
   item: PackItem;
-  data: Uint8Array;
+  /**
+   * 文件内容；**null 表示这一项下载失败了**。
+   *
+   * 失败也要占住自己的序号：写入线程是按序号 0、1、2… 取的，
+   * 失败了却不占位的话，下一个序号永远等不到，后面的文件会被一直压在
+   * buffer 里 —— 队列一关，它们就跟着消失，包里只剩失败项之前的那几个。
+   */
+  data: Uint8Array | null;
 }
 
 function errorText(err: unknown): string {
@@ -255,6 +262,8 @@ export async function packIntoOpfs(options: PackOptions): Promise<PackResult> {
         const message = errorText(err);
         failed.push({ itemId: item.itemId, error: message });
         options.onItemFailed?.(item.itemId, message);
+        // 占住这个序号，让写入线程继续往下走（内容为 null，不会写进包里）
+        queue.push(index, { item, data: null });
       }
     }
   };
@@ -293,6 +302,8 @@ export async function packIntoOpfs(options: PackOptions): Promise<PackResult> {
       const entry = await queue.take();
       if (!entry) break;
       if (signal.aborted) break;
+      // 这一项没下载成功：序号已经推进，跳过它，后面的文件照写
+      if (!entry.data) continue;
 
       if (!writer) await openPack();
 
@@ -325,6 +336,21 @@ export async function removePack(dirName: string, packName: string): Promise<voi
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(dirName);
     await dir.removeEntry(packName);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 把整个任务目录删掉。
+ *
+ * 取消时用这个：包里可能有几个已经写好的包，也可能有**没写完的半成品**。
+ * 只按名字删那几个已知的包不够 —— 半成品会一直躺在 OPFS 里。
+ */
+export async function removePackDir(dirName: string): Promise<void> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(dirName, { recursive: true });
   } catch {
     /* ignore */
   }

@@ -13,7 +13,7 @@
  */
 
 import type { OffscreenToWorker, WorkerToOffscreen } from '../shared/messages';
-import { packIntoOpfs, removePack } from './pack';
+import { packIntoOpfs, removePack, removePackDir } from './pack';
 
 /** 正在跑的任务：taskId → 中断控制器 */
 const running = new Map<string, AbortController>();
@@ -112,6 +112,36 @@ async function createPackUrl(dirName: string, packName: string): Promise<string 
 async function handleCleanup(message: Extract<WorkerToOffscreen, { type: 'ZIP_CLEANUP' }>): Promise<void> {
   const { taskId, dirName, packNames } = message;
   for (const name of packNames) await removePack(dirName, name);
+  // 目录本身也删掉 —— 一个任务一个目录（pack-<taskId>），
+  // 包删完之后留着个空目录也是垃圾，攒多了 OPFS 就没法看了
+  if (dirName) await removePackDir(dirName);
+  const handles = delivered.get(taskId) ?? [];
+  for (const handle of handles) {
+    try {
+      URL.revokeObjectURL(handle.url);
+    } catch {
+      /* ignore */
+    }
+  }
+  delivered.delete(taskId);
+}
+
+/**
+ * 取消一个任务：临时产物一样都不留。
+ *
+ * 为什么不能只 abort 打包：
+ *   - 打包写到一半被取消，OPFS 目录里会留下**没写完的半成品包**；
+ *   - 包已经交付、浏览器正在下载时取消，那个包和它的 blob: 地址就没人管了。
+ *
+ * 而且删的时机很重要：打包线程可能正拿着文件句柄在写，
+ * 这时候把目录删掉，它下一笔又写回来。所以先等它真的停下来，再删。
+ */
+async function handleCancel(taskId: string): Promise<void> {
+  // 等打包线程退出（handleStart 的 finally 会把 taskId 从 running 里删掉）
+  for (let i = 0; i < 60 && running.has(taskId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await removePackDir(`pack-${taskId}`);
   const handles = delivered.get(taskId) ?? [];
   for (const handle of handles) {
     try {
@@ -132,6 +162,8 @@ chrome.runtime.onMessage.addListener((message: WorkerToOffscreen, _sender, sendR
   }
   if (message?.type === 'ZIP_CANCEL') {
     running.get(message.taskId)?.abort();
+    // 取消 = 这个任务的临时产物一样都不留（半成品包、已交付的 blob 地址）
+    void handleCancel(message.taskId);
     return false;
   }
   if (message?.type === 'ZIP_CLEANUP') {

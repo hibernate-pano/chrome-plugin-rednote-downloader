@@ -30,6 +30,23 @@ import { icon } from './ui/icons';
 const NOTE_KEY = 'note';
 const BATCH_KEY = 'batch';
 
+/**
+ * 事件路径里最近的那个笔记卡片。
+ *
+ * 为什么不用 event.target.closest：
+ * 鼠标移进 shadow DOM 里的按钮时，event.target 会被**重定向成宿主元素**
+ * （rednote-root），closest 找不到卡片 —— 于是快捷下载按钮在鼠标还没碰到它时
+ * 就被藏起来了，用户根本点不到。composedPath 给的是真实路径。
+ */
+function findNoteItem(path: EventTarget[]): HTMLElement | null {
+  for (const node of path) {
+    if (node instanceof HTMLElement && node.matches('section.note-item, .note-item')) {
+      return node;
+    }
+  }
+  return null;
+}
+
 class App {
   private bridge = new PageBridge();
   private detector: Detector;
@@ -611,6 +628,15 @@ class App {
 
   private progressMap = new Map<string, DownloadProgress>();
 
+  /**
+   * 已经报过「完成」的任务。
+   *
+   * 一个任务结束时会连着收到好几条进度广播（完成一条 → 收尾 → 全量再同步一次），
+   * 每条都是「全部结束」的状态。不记一下的话，用户会看到两三条一模一样的
+   * 「已保存 N 个文件」。任务重新开工（重试）时把它从集合里去掉，下次完成再报。
+   */
+  private announced = new Set<string>();
+
   private async startDownload(items: MediaItem[]): Promise<void> {
     if (items.length === 0) return;
     // 文件类型筛选在这里兜底：所有入口（面板按钮、主页悬停按钮）都走这一条路
@@ -675,8 +701,6 @@ class App {
     }
 
     const all = [...this.progressMap.values()];
-    const completed = all.filter((p) => p.state === 'completed').length;
-    const failed = all.filter((p) => p.state === 'failed').length;
     const running = all.filter(
       (p) =>
         p.state === 'downloading' ||
@@ -696,16 +720,46 @@ class App {
     // 整块重画会把几十张卡片的缩略图反复重建，主线程会明显卡顿
     this.panel.patchProgress(list);
 
+    const taskIds = new Set(all.map((p) => String(p.taskId)));
+    // 这个页面自己发起的任务（别的页面发起的，状态也会同步过来，只是不归我们报）
+    const mineIds = new Set(
+      [this.noteTaskId, this.batchTaskId].filter((id): id is string => Boolean(id)),
+    );
+
     if (running === 0 && total > 0 && settled === total) {
       this.panel.setFabBackgroundProgress(null);
-      if (failed === 0) {
-        this.toast.success(`已保存 ${completed} 个文件`);
+      // 同一批进度会重复广播（完成一条 → 收尾 → 全量再同步一次），
+      // 每条都是「全部结束」。同一个任务只报一次。
+      //
+      // 而且只报**这个页面自己发起的**任务：换到新页面后，后台还会把
+      // 之前那些任务的状态同步过来（面板要能显示「已保存」），但它们早就
+      // 报过了 —— 再弹一次就是用户看到的「下载完了弹两遍」。
+      const mine = [...taskIds].some((id) => mineIds.has(id));
+      const fresh = [...taskIds].some((id) => !this.announced.has(id));
+      if (!mine || !fresh) return;
+      taskIds.forEach((id) => this.announced.add(id));
+
+      // 数数只数自己的任务：同步过来的旧任务里可能有失败项，
+      // 混进来会把「保存好了」说成「下载失败」
+      const own = all.filter((p) => mineIds.has(String(p.taskId)));
+      const done = own.filter((p) => p.state === 'completed').length;
+      const bad = own.filter((p) => p.state === 'failed').length;
+
+      if (bad === 0) {
+        // 全部取消 / 一个都没下成的时候不能报「已保存 0 个文件」——
+        // 那是句假话，还会让人以为取消没生效。没存下东西就不报喜。
+        if (done > 0) this.toast.success(`已保存 ${done} 个文件`);
       } else {
-        this.toast.error(`${failed} 个文件下载失败`, '点击可在面板中重试', {
+        this.toast.error(`${bad} 个文件下载失败`, '点击可在面板中重试', {
           label: '查看',
           onClick: () => this.panel.open(),
         });
       }
+    } else if (running > 0) {
+      // 任务又开工了（比如点了重试）：下一次完成要重新报。
+      // 只清**本页自己发起**的那些 —— 别的页面同步过来的任务跟本页面无关，
+      // 它们的「已报过」标记不该被这里动。
+      mineIds.forEach((id) => this.announced.delete(id));
     }
   }
 
@@ -793,8 +847,12 @@ class App {
       'mouseover',
       (event) => {
         if (this.pageKind !== 'profile') return;
-        const target = event.target as HTMLElement | null;
-        const item = target?.closest('section.note-item, .note-item') as HTMLElement | null;
+        // 按钮住在 shadow root 里 —— 鼠标移进它时 event.target 是宿主元素，
+        // 用 closest 会「找不到卡片」→ 立刻 hide() → 按钮在鼠标底下消失。
+        // 先认自己的按钮（别藏），再从真实路径里找卡片。
+        const path = event.composedPath();
+        if (path.includes(button)) return;
+        const item = findNoteItem(path);
         if (!item) {
           if (current) hide();
           return;
@@ -814,6 +872,14 @@ class App {
     );
 
     document.addEventListener('mouseout', (event) => {
+      // 指针移向的是我们自己的 UI（快捷按钮、面板）→ 别藏。
+      // relatedTarget 会被重定向成宿主元素，所以比宿主即可。
+      // 不挡这一下的话：鼠标从卡片往按钮走，途经的祖先元素也会冒 mouseout，
+      // 每一层都「不是卡片」→ 按钮在鼠标到达之前就被藏了。
+      const to = event.relatedTarget as Node | null;
+      if (to && (to === this.panel.shadowRoot.host || this.panel.shadowRoot.contains(to))) {
+        return;
+      }
       const target = event.target as HTMLElement | null;
       if (target?.closest('section.note-item, .note-item')) return;
       if (current) hide();

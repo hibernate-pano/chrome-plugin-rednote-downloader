@@ -14,3 +14,4 @@ build/
 
 # 发版产物（商店 zip、商店素材图）—— 都由脚本生成，不进仓库
 out/
+.alma-snapshots

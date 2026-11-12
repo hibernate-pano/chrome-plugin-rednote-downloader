@@ -1,78 +1,34 @@
 /** 面板样式 —— 注入 Shadow DOM，与宿主页样式完全隔离 */
 
+import palette from '../../shared/palette.json';
+
+/**
+ * 把 palette 里的变量变成一段 CSS 声明。
+ *
+ * 色值只有一个来源：src/shared/palette.json。
+ * 以前这里、popup.css、options.css 各写一份 —— 改一处漏两处，
+ * 「说明文字对比度不足」就是这么来的。
+ */
+function vars(colors: Record<string, string>): string {
+  return Object.entries(colors)
+    .map(([name, value]) => `  ${name}: ${value};`)
+    .join('\n');
+}
+
 export const STYLES = `
 :host {
   all: initial;
 
-  --brand: #FF2442;
-  --brand-text: #D81E38;
-  --brand-press: #E01F3D;
-  --brand-grad: linear-gradient(135deg, #FF5C72 0%, #FF2442 100%);
-  --brand-soft: rgba(255, 36, 66, .10);
+${vars(palette.light)}
 
-  --bg-canvas: #FFFFFF;
-  --bg-raised: #F7F7F9;
-  --bg-sunken: #F0F0F3;
-  --bg-hover: #F2F2F5;
-  --bg-active: #ECECF0;
-  --border: #E9E9EE;
-  --border-strong: #D8D8E0;
-
-  --text-1: #18181C;
-  --text-2: #5E5E69;
-  --text-3: #9494A0;
-
-  --success: #0F9D58;
-  --success-bg: #ECFDF3;
-  --warning: #B7791F;
-  --warning-bg: #FFFAEB;
-  --danger: #D92D20;
-  --danger-bg: #FEF3F2;
-
-  --sh-fab: 0 6px 16px rgba(255,36,66,.30), 0 2px 4px rgba(20,20,30,.12);
-  --sh-panel: 0 16px 48px rgba(20,20,35,.18), 0 4px 12px rgba(20,20,35,.10);
-  --sh-card: 0 2px 8px rgba(20,20,35,.08);
-  --sh-card-hov: 0 6px 16px rgba(20,20,35,.14);
-  --sh-pop: 0 8px 24px rgba(20,20,35,.16);
-  --sh-toast: 0 8px 28px rgba(20,20,35,.20);
-
-  --focus-ring: rgba(255,36,66,.30);
-
-  --r-xs: 4px; --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px;
-
+  /* 字体栈不进 palette：面板和扩展页面用的是两套，各自有道理，
+     不是「改一处漏两处」的那种重复 */
   --font: -apple-system, BlinkMacSystemFont, "SF Pro SC", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
 }
 
 :host([data-theme="dark"]) {
-  --brand: #FF4D62;
-  --brand-text: #FF7A8C;
-  --brand-press: #FF5C6E;
-  --brand-grad: linear-gradient(135deg, #FF6B7E 0%, #FF3B52 100%);
-  --brand-soft: rgba(255,77,98,.16);
-  --bg-canvas: #1B1B1F;
-  --bg-raised: #242429;
-  --bg-sunken: #2C2C33;
-  --bg-hover: #2A2A30;
-  --bg-active: #32323A;
-  --border: #34343C;
-  --border-strong: #45454F;
-  --text-1: #F0F0F4;
-  --text-2: #A2A2AE;
-  --text-3: #6E6E7A;
-  --success: #32D583;
-  --success-bg: #14261D;
-  --warning: #FDB022;
-  --warning-bg: #2E2413;
-  --danger: #F97066;
-  --danger-bg: #2A1A1C;
-  --sh-fab: 0 6px 16px rgba(0,0,0,.45);
-  --sh-panel: 0 16px 48px rgba(0,0,0,.55), 0 4px 12px rgba(0,0,0,.4);
-  --sh-card: 0 2px 8px rgba(0,0,0,.35);
-  --sh-card-hov: 0 6px 16px rgba(0,0,0,.5);
-  --sh-pop: 0 8px 24px rgba(0,0,0,.5);
-  --sh-toast: 0 8px 28px rgba(0,0,0,.55);
-  --focus-ring: rgba(255,77,98,.38);
+${vars(palette.dark)}
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
