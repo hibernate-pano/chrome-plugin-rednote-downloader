@@ -11,6 +11,7 @@
     "check": "tsc --noEmit && node build.mjs",
     "pretest": "esbuild tests/core.test.ts --bundle --format=esm --platform=node --outfile=build/test/core.test.mjs --log-level=error && esbuild tests/downloader.test.ts --bundle --format=esm --platform=node --outfile=build/test/downloader.test.mjs --log-level=error && esbuild tests/zip.test.ts --bundle --format=esm --platform=node --outfile=build/test/zip.test.mjs --log-level=error && esbuild tests/pack.test.ts --bundle --format=esm --platform=node --outfile=build/test/pack.test.mjs --log-level=error && esbuild src/background/downloader.ts --bundle --format=esm --platform=node --outfile=build/test/_downloader.mjs --log-level=error",
     "test": "node --test \"build/test/*.test.mjs\"",
+    "check:palette": "node build.mjs && node scripts/check-palette.mjs",
     "e2e": "node build.mjs && node scripts/e2e-ui.mjs && node scripts/e2e.mjs && node scripts/e2e-batch.mjs && node scripts/e2e-zip.mjs",
     "e2e:ui": "node build.mjs && node scripts/e2e-ui.mjs",
     "e2e:batch": "node build.mjs && node scripts/e2e-batch.mjs",
