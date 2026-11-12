@@ -1,7 +1,7 @@
 # v1.4.0 发版记录
 
 **日期**：2026-11-12
-**状态**：GitHub 已发布 ✅ / Chrome 商店 ⛔ 未提交（缺 item id）
+**状态**：GitHub 已发布 ✅ / Chrome 商店 **已提交审核**（商店回包 `status:["OK"]`，verify 回 400「in review」自证）
 
 ## 已完成
 
@@ -15,26 +15,38 @@
 | tag `v1.4.0` | ✅ 已推送 |
 | `master` 推送 origin | ✅ `9f35ff1..c85c371` |
 
-## 商店三步只走到「准备」
+## Chrome 商店
 
-- **凭据有效**：`cws-mcp` 的 refresh token 换 token 成功，scope = `.../auth/chromewebstore`。
-- **但没有 item id**：`docs/store-listing.md` 第 134 行「商店 item 已创建」仍是未勾选框。
-  本机 Chrome 里也没装过商店版，仓库任何历史 manifest 都没有 `key` 字段 ⇒ **这个扩展从没在商店建过 item**。
-- **API 只能更新、不能创建** ⇒ 上传与提交审核都走不通，不是脚本问题。
+item id：`lkbaggcclpoclohncmdfaicjepaplgje`（由 Jasper 提供）
 
-## 卡在哪、需要什么
+| 步骤 | 证据 | 结论 |
+|---|---|---|
+| 上传前基线 | 草稿 `crxVersion=1.3.2`、公开页 `Version 1.3.2 / Updated October 26, 2026` | 线上还是 1.3.2 |
+| upload | 「✓ 上传成功（1.4.0）」；**回读草稿 `crxVersion=1.4.0`** | 包进草稿了 |
+| publish | `status:["OK"]`，且发布前自检「草稿 crxVersion=1.4.0（期望 1.4.0）」通过 | 已提交审核 |
+| verify | HTTP 400 `You may not edit or publish an item that is in review` | **确实进了审核队列** |
+| live 复核 | 公开页仍是 `1.3.2 / October 26, 2026` | 还没放行，等审核 |
 
-**需要人工一步**：在 [Chrome Web Store Developer Dashboard](https://chrome.google.com/webstore/devconsole)
-点「新增项目」上传 `out/extension.zip` 建 item。建好之后 URL 最后一段就是 item id。
+> `uploadState` 一直是 `NOT_FOUND` —— 它在上传成功后也是这个值，**不能拿它当成功判据**。
+> 真正的判据是草稿 `crxVersion` 变成了 1.4.0。
+>
+> 「in review」的歧义（可能是在审上一版 vs 这一版）已排除：
+> 草稿 crxVersion 正是要发的 1.4.0，且公开页仍是 1.3.2 ⇒ 在审的是这一版。
 
-拿到 item id 后我这边可以直接跑完剩下三步：
+产物：`out/extension.zip`，sha256 `350878a5eef8e088d13c28c0b2d810e04b05842152ceb68bd32e1de3bb7d6b35`，85KB / 18 项。
+构建产物比源码新（`find src public -newer` 为空），不是旧包。
 
-```bash
-SKILL=~/.config/magpie/library/skills/chrome-store-release/scripts/cws-release.mjs
-node $SKILL upload  out/extension.zip                          --item-id <ID>   # 判据 uploadState=SUCCESS
-node $SKILL publish 1.4.0                                      --item-id <ID>   # 判据 status 含 OK
-node $SKILL verify  1.4.0                                      --item-id <ID>   # 400「in review」= 真的进队列了
-```
+### 审核放行后要做的
+
+- [ ] 公开页 `Version` 变成 1.4.0
+- [ ] 公开页 `Updated` 变成今天
+- [ ] 台账把「已提交审核」改成「已上架（公开页 Version 1.4.0）」
+- [ ] README 的商店徽章 / 版本号如果写死了旧版本，一并更新
+
+### 仍需人工做（API 没有对应端点，只能 GUI）
+
+1. **商店素材上传**：`out/store/promo-440x280.png`、`screenshot-note.png`、`screenshot-batch.png`
+2. **商店表单字段**：文案已全部写好，照抄 `docs/store-listing.md` 即可
 
 ## 另外还欠两样（都在 dashboard 里手动做，API 没有对应端点）
 

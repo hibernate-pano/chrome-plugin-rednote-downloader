@@ -131,7 +131,7 @@
 - [x] zip 根目录就是 `manifest.json`，不含源码与 map
 - [x] 素材尺寸与 alpha 通道符合商店要求
 - [x] 隐私政策是公开网址
-- [ ] 商店 item 已创建（**首次上架必须先在后台建 item，API 只能更新不能创建**）
+- [x] 商店 item 已创建 —— item id `lkbaggcclpoclohncmdfaicjepaplgje`（2026-10-26 首次上架 1.3.2 时建的）
 - [ ] `upload` 返回 `uploadState: SUCCESS`
 - [ ] 草稿里的 `crxVersion` = 1.4.0
 - [ ] `publish` 返回 `status: ["OK"]`
