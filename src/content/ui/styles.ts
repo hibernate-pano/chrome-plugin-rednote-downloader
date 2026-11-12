@@ -20,7 +20,7 @@ export const STYLES = `
 
   --text-1: #18181C;
   --text-2: #5E5E69;
-  --text-3: #9494A0;
+  --text-3: #6B6B76;
 
   --success: #0F9D58;
   --success-bg: #ECFDF3;
@@ -59,7 +59,7 @@ export const STYLES = `
   --border-strong: #45454F;
   --text-1: #F0F0F4;
   --text-2: #A2A2AE;
-  --text-3: #6E6E7A;
+  --text-3: #8E8E9A;
   --success: #32D583;
   --success-bg: #14261D;
   --warning: #FDB022;

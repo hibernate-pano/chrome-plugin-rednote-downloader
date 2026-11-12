@@ -10,7 +10,7 @@
   --border-strong: #d8d8e0;
   --text-1: #18181c;
   --text-2: #5e5e69;
-  --text-3: #9494a0;
+  --text-3: #6b6b76;
   --success: #0f9d58;
   --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei",
     "Helvetica Neue", Arial, sans-serif;
@@ -29,7 +29,7 @@
     --border-strong: #45454f;
     --text-1: #f0f0f4;
     --text-2: #a2a2ae;
-    --text-3: #6e6e7a;
+    --text-3: #8e8e9a;
     --success: #32d583;
   }
 }
