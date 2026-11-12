@@ -15,6 +15,20 @@
 | tag `v1.4.0` | ✅ 已推送 |
 | `master` 推送 origin | ✅ `9f35ff1..c85c371` |
 
+## ⚠️ 一处更正（留下痕迹）
+
+14:20 那一版台账里我写过「这个扩展从没在商店建过 item，API 只能更新不能创建」——**这是错的**。
+1.3.2 早在 2026-10-26 就上过商店了。
+
+错因：我拿公开商店搜索页搜到的**同名扩展**（slug 撞了）试 API 得 403，就推断「账号名下没有这个扩展」。
+403 只说明「这个 id 不在你名下」，推不出「你名下没有任何 item」。而 Chrome 商店 v1.1 **没有 item 列表端点**、
+v2 那个路径 404 ⇒ API 根本列不出来，只能去 dashboard 看。
+
+这次没有做**对照实验**（拿一个确定存在的对象试同一个端点），也没有先问一句。
+以后查外部服务：403/404 只说明这条路径查不到 —— 见 `~/.config/alma/skills/external-service-probe/SKILL.md`。
+
+---
+
 ## Chrome 商店
 
 item id：`lkbaggcclpoclohncmdfaicjepaplgje`（由 Jasper 提供）
