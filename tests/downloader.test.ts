@@ -49,6 +49,11 @@ interface FakeChrome {
   };
   runtime: { sendMessage: (msg: unknown) => Promise<unknown> };
   tabs: { sendMessage: (tabId: number, msg: unknown) => Promise<unknown> };
+  offscreen: {
+    createDocument: (opts: unknown) => Promise<void>;
+    hasDocument: () => Promise<boolean>;
+    Reason: { BLOBS: string };
+  };
 }
 
 const sessionStore: Record<string, unknown> = {};
@@ -59,6 +64,8 @@ const stub = {
   downloads: new Map<number, FakeDownload>(),
   nextId: 1,
   settings: {} as Record<string, unknown>,
+  /** downloads.download 被调用了几次（判断「有没有真的去起下载」） */
+  downloadCalls: 0,
 };
 
 function installChrome(): FakeChrome {
@@ -68,6 +75,7 @@ function installChrome(): FakeChrome {
   const fake: FakeChrome = {
     downloads: {
       download: async () => {
+        stub.downloadCalls += 1;
         const step = stub.nextDownload.shift();
         if (!step) throw new Error('没有预置的 download 结果');
         if (!step.ok) throw new Error(step.error);
@@ -97,8 +105,19 @@ function installChrome(): FakeChrome {
         },
       },
     },
-    runtime: { sendMessage: async () => undefined },
+    runtime: {
+      sendMessage: async (msg) => {
+        // 打包模式：后台页面收到 ZIP_START 要立刻回话「收到了」
+        if ((msg as { type?: string })?.type === 'ZIP_START') return { ok: true };
+        return undefined;
+      },
+    },
     tabs: { sendMessage: async () => undefined },
+    offscreen: {
+      createDocument: async () => undefined,
+      hasDocument: async () => true,
+      Reason: { BLOBS: 'BLOBS' },
+    },
   };
   (globalThis as any).chrome = fake;
   return fake;
@@ -467,6 +486,89 @@ test('取消：正在下载的条目取消后不会再被浏览器事件改回 c
   const snap = mod.getTaskSnapshot('task-9');
   assert.equal(snap?.items[0]?.state, 'cancelled', '取消之后不该被改回「已完成」');
   assert.equal(snap?.summary.completed, 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* 打包任务的终态                                                        */
+/* ------------------------------------------------------------------ */
+
+/** 打包模式：两个文件才会进打包流程（shouldPack 要求多于一个） */
+function installZipChrome(): void {
+  installChrome();
+  stub.settings['rednote.settings'] = { downloadMode: 'zip' };
+}
+
+const ZIP_ITEMS = [
+  { itemId: 'i1', url: 'https://cdn/1.jpg', filename: '1.jpg', kind: 'image' as const },
+  { itemId: 'i2', url: 'https://cdn/2.jpg', filename: '2.jpg', kind: 'image' as const },
+];
+
+const PACK = {
+  dirName: 'pack-demo',
+  name: 'pack-1.zip',
+  objectUrl: 'blob:fake',
+  downloadPath: '小红书/演示.zip',
+};
+
+test('打包：一个都没成功（空包）时任务也要收尾，不能一直挂在下载中', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-empty', ZIP_ITEMS);
+  await settle();
+
+  // 两个文件都下失败了（打包引擎逐条报）
+  await mod.handleOffscreenEvent({ type: 'ZIP_ITEM_FAILED', taskId: 'zip-empty', itemId: 'i1', error: 'HTTP 500' });
+  await mod.handleOffscreenEvent({ type: 'ZIP_ITEM_FAILED', taskId: 'zip-empty', itemId: 'i2', error: 'HTTP 500' });
+  // 打包引擎收工：一个文件都没进包
+  await mod.handleOffscreenEvent({ type: 'ZIP_PACKS_READY', taskId: 'zip-empty', packs: [] });
+  await settle();
+
+  const snap = mod.getTaskSnapshot('zip-empty');
+  assert.equal(snap?.summary.failed, 2);
+  assert.ok(snap?.summary.finishedAt, '空包没有收尾：finishedAt 是空的，界面会一直转圈');
+});
+
+test('打包：包写出来了但没交给浏览器，任务也要收尾', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-deliver', ZIP_ITEMS);
+  await settle();
+
+  // 交给浏览器时失败（比如文件名非法）
+  stub.nextDownload = [{ ok: false, error: 'Invalid filename' }];
+  await mod.handleOffscreenEvent({ type: 'ZIP_PACKS_READY', taskId: 'zip-deliver', packs: [PACK] });
+  await settle();
+
+  const snap = mod.getTaskSnapshot('zip-deliver');
+  assert.equal(snap?.summary.failed, 2, '没交出去的包，里面的文件都要算失败');
+  assert.ok(snap?.summary.finishedAt, '交付失败没有收尾：finishedAt 是空的');
+});
+
+test('打包：取消之后落到终态，迟到的「包好了」也不会再起下载', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-cancel', ZIP_ITEMS);
+  await settle();
+
+  await mod.cancelTask('zip-cancel');
+  const after = mod.getTaskSnapshot('zip-cancel');
+  assert.deepEqual(
+    after?.items.map((i) => i.state),
+    ['cancelled', 'cancelled'],
+  );
+  assert.ok(after?.summary.finishedAt, '取消之后任务要有终态时间');
+
+  // 后台页面慢半拍：取消之后才把包报上来
+  const callsBefore = stub.downloadCalls;
+  await mod.handleOffscreenEvent({ type: 'ZIP_PACKS_READY', taskId: 'zip-cancel', packs: [PACK] });
+  await settle();
+
+  assert.equal(stub.downloadCalls, callsBefore, '取消之后不该再去下载压缩包');
+  assert.deepEqual(
+    mod.getTaskSnapshot('zip-cancel')?.items.map((i) => i.state),
+    ['cancelled', 'cancelled'],
+    '迟到的包不该把条目从「已取消」拉回去',
+  );
 });
 
 /* ------------------------------------------------------------------ */

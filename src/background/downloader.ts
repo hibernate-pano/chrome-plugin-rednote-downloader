@@ -628,7 +628,14 @@ async function startPackDeliveries(
   record: TaskRecord,
   packs: { dirName: string; name: string; objectUrl: string; downloadPath: string }[],
 ): Promise<void> {
+  // 打包阶段已经不在跑了（用户取消了，或者这一批已经交付过）：
+  // 迟到的「包好了」直接丢掉。不然取消了还会再存一个压缩包出来。
+  if (!record.running.has('z:pack')) return;
   record.running.delete('z:pack');
+  // 进了交付阶段，队列里那份「待下载清单」就没用了：文件已经在包里，
+  // 接下来只看浏览器那条下载。不清空的话 checkFinished 会一直以为还有活儿，
+  // 空包 / 交付失败这两种收尾永远走不到。
+  record.queue = [];
   const started: number[] = [];
   for (const pack of packs) {
     try {
@@ -660,6 +667,22 @@ async function startPackDeliveries(
   await persist();
   await broadcast(record, true);
   ensureHeartbeat();
+
+  if (started.length === 0) {
+    // 一个包都没交出去（空包，或者交付时全失败）：后面不会再有浏览器下载
+    // 事件来触发收尾，这里必须自己确认终态 —— 否则任务永远停在「下载中」。
+    if (packs.length > 0) {
+      void chrome.runtime
+        .sendMessage({
+          type: 'ZIP_CLEANUP',
+          taskId: record.taskId,
+          dirName: packs[0]?.dirName ?? '',
+          packNames: packs.map((pack) => pack.name),
+        })
+        .catch(() => undefined);
+    }
+    await checkFinished(record);
+  }
 }
 
 /**
