@@ -584,6 +584,41 @@ async function main() {
   `);
   check('面板没有再提「选目录」', !/选目录|保存目录/.test(footer), footer);
 
+  /* ---------------------------------------------------------------- */
+  /* 5. 临时的包和目录不能留在 OPFS 里                                 */
+  /* ---------------------------------------------------------------- */
+  /* 包存完了只删文件、不删目录，攒多了 OPFS 里全是 pack-xxx 空目录。   */
+  /* 这里直接去后台页面的 OPFS 里数，不看日志、不看状态码。            */
+  if (offCdp) {
+    let listing = '';
+    for (let i = 0; i < 20; i += 1) {
+      listing = await offCdp
+        .eval(`
+          (async () => {
+            const root = await navigator.storage.getDirectory();
+            const names = [];
+            for await (const [name] of root.entries()) names.push(name);
+            return JSON.stringify(names);
+          })()
+        `)
+        .catch(() => '');
+      try {
+        const list = JSON.parse(String(listing));
+        if (Array.isArray(list) && !list.some((n) => String(n).startsWith('pack-'))) break;
+      } catch {
+        /* ignore */
+      }
+      await sleep(200);
+    }
+    check(
+      '打包完成后 OPFS 里不留临时包目录',
+      !/pack-/.test(String(listing)),
+      `OPFS=${String(listing)}`,
+    );
+  } else {
+    check('打包完成后 OPFS 里不留临时包目录', false, '没连上后台页面');
+  }
+
   cleanup();
   const passed = results.filter((r) => r.ok).length;
   console.log(`\n═══ 结果：${passed}/${results.length} 通过 ═══`);
