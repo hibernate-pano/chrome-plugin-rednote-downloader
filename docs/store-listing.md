@@ -132,8 +132,8 @@
 - [x] 素材尺寸与 alpha 通道符合商店要求
 - [x] 隐私政策是公开网址
 - [x] 商店 item 已创建 —— item id `lkbaggcclpoclohncmdfaicjepaplgje`（2026-10-26 首次上架 1.3.2 时建的）
-- [ ] `upload` 返回 `uploadState: SUCCESS`
-- [ ] 草稿里的 `crxVersion` = 1.4.0
-- [ ] `publish` 返回 `status: ["OK"]`
-- [ ] 再发一次 publish 拿到「in review」自证
-- [ ] 公开页 `Version` = 1.4.0
+- [x] 上传进草稿 —— 判据是**回读草稿 `crxVersion` = 1.4.0**。`uploadState` 这个字段即使上传成功也返回 `NOT_FOUND`，不能当成功判据（它不是「没有这个扩展」，是「这个字段读不到」）
+- [x] 草稿里的 `crxVersion` = 1.4.0
+- [x] `publish` 返回 `status: ["OK"]`
+- [x] 再发一次 publish 拿到「in review」自证（HTTP 400 `You may not edit or publish an item that is in review`）
+- [x] 公开页 `Version` = 1.4.0（2026-11-12 21:15 实证 `Version 1.4.0 / Updated November 11, 2026`）

@@ -1,7 +1,7 @@
 # v1.4.0 发版记录
 
 **日期**：2026-11-12
-**状态**：GitHub 已发布 ✅ / Chrome 商店 **已提交审核**（商店回包 `status:["OK"]`，verify 回 400「in review」自证）
+**状态**：GitHub 已发布 ✅ / Chrome 商店 **已上架** ✅（2026-11-12 21:15 公开页实证 `Version 1.4.0 / Updated November 11, 2026`）
 
 ## 已完成
 
@@ -39,7 +39,8 @@ item id：`lkbaggcclpoclohncmdfaicjepaplgje`（由 Jasper 提供）
 | upload | 「✓ 上传成功（1.4.0）」；**回读草稿 `crxVersion=1.4.0`** | 包进草稿了 |
 | publish | `status:["OK"]`，且发布前自检「草稿 crxVersion=1.4.0（期望 1.4.0）」通过 | 已提交审核 |
 | verify | HTTP 400 `You may not edit or publish an item that is in review` | **确实进了审核队列** |
-| live 复核 | 公开页仍是 `1.3.2 / October 26, 2026` | 还没放行，等审核 |
+| live 复核（提审当时） | 公开页仍是 `1.3.2 / October 26, 2026` | 当时还没放行，等审核 |
+| **live 复核（2026-11-12 21:15）** | 公开页 `Version 1.4.0 / Updated November 11, 2026` | **审核已放行，1.4.0 已上架** |
 
 > `uploadState` 一直是 `NOT_FOUND` —— 它在上传成功后也是这个值，**不能拿它当成功判据**。
 > 真正的判据是草稿 `crxVersion` 变成了 1.4.0。
@@ -52,10 +53,10 @@ item id：`lkbaggcclpoclohncmdfaicjepaplgje`（由 Jasper 提供）
 
 ### 审核放行后要做的
 
-- [ ] 公开页 `Version` 变成 1.4.0
-- [ ] 公开页 `Updated` 变成今天
-- [ ] 台账把「已提交审核」改成「已上架（公开页 Version 1.4.0）」
-- [ ] README 的商店徽章 / 版本号如果写死了旧版本，一并更新
+- [x] 公开页 `Version` 变成 1.4.0（2026-11-12 21:15 实证）
+- [x] 公开页 `Updated` 变成 November 11, 2026
+- [x] 台账把「已提交审核」改成「已上架（公开页 Version 1.4.0）」
+- [x] README 的商店徽章 / 版本号 —— 查过了，README 里没有写死旧版本号，无需改
 
 ### 仍需人工做（API 没有对应端点，只能 GUI）
 
