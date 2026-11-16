@@ -515,6 +515,9 @@ const PACK = {
   name: 'pack-1.zip',
   objectUrl: 'blob:fake',
   downloadPath: '小红书/演示.zip',
+  bytes: 100,
+  entries: 2,
+  itemIds: ['i1', 'i2'],
 };
 
 test('打包：一个都没成功（空包）时任务也要收尾，不能一直挂在下载中', async () => {
@@ -860,4 +863,100 @@ test('打包的压缩包存不下来时：要通知后台页面删掉临时包',
 
   const cleanups = stub.sentMessages.filter((m) => m.type === 'ZIP_CLEANUP');
   assert.equal(cleanups.length, 1, '存失败的包留在 OPFS 里没人清');
+});
+
+/* ------------------------------------------------------------------ */
+/* 多包交付：一个包出事不能连累另一个                                   */
+/* ------------------------------------------------------------------ */
+
+const ZIP_ITEMS_3 = [
+  ...ZIP_ITEMS,
+  { itemId: 'i3', url: 'https://cdn/3.jpg', filename: '3.jpg', kind: 'image' as const },
+];
+
+test('多包：一个包被取消，已落盘的另一个包里的文件仍是完成', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-multi', ZIP_ITEMS_3);
+  await settle();
+
+  stub.nextDownload = [
+    { ok: true, id: 91 },
+    { ok: true, id: 92 },
+  ];
+  stub.downloads.set(91, { id: 91, state: 'complete', bytesReceived: 100, totalBytes: 100, fileSize: 100, filename: 'a.zip' });
+  stub.downloads.set(92, { id: 92, state: 'in_progress', bytesReceived: 10, totalBytes: 100, filename: 'b.zip' });
+
+  await mod.handleOffscreenEvent({
+    type: 'ZIP_PACKS_READY',
+    taskId: 'zip-multi',
+    packs: [
+      { ...PACK, itemIds: ['i1', 'i2'] },
+      { ...PACK, name: 'pack-2.zip', objectUrl: 'blob:fake2', downloadPath: '小红书/演示-2.zip', itemIds: ['i3'] },
+    ],
+  });
+  await settle(900);
+
+  // 用户在下载栏取消了第二个包
+  stub.downloads.set(92, {
+    id: 92,
+    state: 'interrupted',
+    bytesReceived: 10,
+    totalBytes: 100,
+    error: 'USER_CANCELED',
+    filename: 'b.zip',
+  });
+  await settle(1600);
+
+  const snap = mod.getTaskSnapshot('zip-multi');
+  assert.deepEqual(
+    snap?.items.map((i) => i.state),
+    ['completed', 'completed', 'cancelled'],
+    '取消一个包不该把已经落盘的另一个包判成失败；从下载栏取消应算「已取消」而不是「失败」',
+  );
+  assert.equal(snap?.summary.failed, 0, '用户自己取消不该记成失败');
+
+  // 清理只针对出事的那个包，别把还在被读的目录整个删掉
+  const cleanups = stub.sentMessages.filter(
+    (m): m is { type: string; packNames?: string[]; keepDir?: boolean } => m.type === 'ZIP_CLEANUP',
+  );
+  assert.equal(cleanups.length, 2, '两个包各清各的');
+  assert.deepEqual(cleanups[0]?.packNames, ['pack-1.zip']);
+  assert.equal(cleanups[0]?.keepDir, true, '还有一个包在下载时不能删目录');
+  assert.deepEqual(cleanups[1]?.packNames, ['pack-2.zip'], '只该删出事的那一个包');
+  assert.equal(cleanups[1]?.keepDir, false, '最后一个包结束时目录要一起删掉');
+});
+
+test('打包还在跑的时候点重试：不能并发起第二个包', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-retry', ZIP_ITEMS);
+  await settle();
+
+  await mod.handleOffscreenEvent({ type: 'ZIP_ITEM_FAILED', taskId: 'zip-retry', itemId: 'i1', error: 'HTTP 500' });
+  await settle();
+
+  const before = stub.sentMessages.filter((m) => m.type === 'ZIP_START').length;
+  await mod.retryItem('zip-retry', 'i1');
+  await settle();
+
+  const after = stub.sentMessages.filter((m) => m.type === 'ZIP_START').length;
+  assert.equal(after, before, '打包没结束就重试会让两个包写同一个 OPFS 目录，必须拒绝');
+  const item = mod.getTaskSnapshot('zip-retry')?.items.find((i) => i.itemId === 'i1');
+  assert.equal(item?.state, 'failed', '被拒绝的重试不该把条目挂在 queued 上');
+  assert.match(String(item?.error), /还在打包/, '要说清为什么现在不能重试');
+});
+
+test('打包失败（ZIP_FAILED）：要通知后台页面清掉临时产物', async () => {
+  installZipChrome();
+  const mod = await freshDownloader();
+  await mod.startDownloads(undefined, 'zip-fail', ZIP_ITEMS);
+  await settle();
+
+  await mod.handleOffscreenEvent({ type: 'ZIP_FAILED', taskId: 'zip-fail', error: 'QuotaExceededError' });
+  await settle(900);
+
+  const cleanups = stub.sentMessages.filter((m) => m.type === 'ZIP_CLEANUP');
+  assert.equal(cleanups.length, 1, '打包失败后 OPFS 里的半成品没人清，攒几次就把配额吃满');
+  assert.equal((cleanups[0] as { dirName?: string }).dirName, 'pack-zip-fail');
 });

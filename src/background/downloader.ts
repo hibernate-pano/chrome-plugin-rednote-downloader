@@ -85,6 +85,14 @@ interface TaskRecord {
   downloadId?: number;
   /** zip 模式：打好的包（下载完了要删掉） */
   packFiles?: { dirName: string; packNames: string[] };
+  /**
+   * zip 模式：每条浏览器下载对应包里装了哪些条目。
+   *
+   * 超过 2GB 会拆成好几个包、各是一条浏览器下载 —— 一条失败只能判**它那个包**
+   * 里的条目失败。以前是按整批算：一个包被取消，已落盘的另一个包也被判失败
+   * 并删掉，用户磁盘上有 zip、界面却说全部失败。
+   */
+  packDeliveries?: Map<number, { itemIds: string[]; packName: string; dirName: string }>;
   /** zip 模式：包打算存到哪里（相对浏览器的下载目录） */
   packPaths?: string[];
 }
@@ -604,6 +612,9 @@ export async function handleOffscreenEvent(message: OffscreenToWorker): Promise<
 
   if (message.type === 'ZIP_FAILED') {
     record.running.delete('z:pack');
+    // 打包失败时 OPFS 里可能已经写出了几个 GB 的半成品 ——
+    // 不删的话，攒几次就把扩展的配额吃满，之后所有打包都失败
+    cleanupPack(record, `pack-${record.taskId}`, [], false);
     for (const item of record.items) {
       if (item.state !== 'downloading') continue;
       item.state = 'failed';
@@ -633,7 +644,13 @@ export async function handleOffscreenEvent(message: OffscreenToWorker): Promise<
  */
 async function startPackDeliveries(
   record: TaskRecord,
-  packs: { dirName: string; name: string; objectUrl: string; downloadPath: string }[],
+  packs: {
+    dirName: string;
+    name: string;
+    objectUrl: string;
+    downloadPath: string;
+    itemIds: string[];
+  }[],
 ): Promise<void> {
   // 打包阶段已经不在跑了（用户取消了，或者这一批已经交付过）：
   // 迟到的「包好了」直接丢掉。不然取消了还会再存一个压缩包出来。
@@ -644,7 +661,11 @@ async function startPackDeliveries(
   // （打包模式本来就不用队列，这里清掉是兜底 —— 万一前面有残留，
   //   checkFinished 会一直以为还有活儿，空包 / 交付失败就永远收不了尾。）
   record.queue = [];
+
+  const deliveries = new Map<number, { itemIds: string[]; packName: string; dirName: string }>();
+  record.packDeliveries = deliveries;
   const started: number[] = [];
+
   for (const pack of packs) {
     try {
       const downloadId = await chrome.downloads.download({
@@ -654,18 +675,19 @@ async function startPackDeliveries(
         saveAs: false,
       });
       started.push(downloadId);
+      deliveries.set(downloadId, {
+        itemIds: pack.itemIds,
+        packName: pack.name,
+        dirName: pack.dirName,
+      });
       record.running.set(`d:${downloadId}`, ZIP_SLOT);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      for (const item of record.items) {
-        if (item.state !== 'downloading') continue;
-        item.state = 'failed';
-        item.error = message;
-        record.summary.failed += 1;
-        record.dirty.add(item.itemId);
-      }
+      // 只判**这个包**里的条目不落盘；别的包可能正好好地下着
+      settlePackItems(record, pack.itemIds, err instanceof Error ? err.message : String(err));
+      cleanupPack(record, pack.dirName, [pack.name], packs.length > 1);
     }
   }
+
   record.downloadId = started[0];
   record.packFiles = {
     dirName: packs[0]?.dirName ?? '',
@@ -680,39 +702,60 @@ async function startPackDeliveries(
     // 一个包都没交出去（空包，或者交付时全失败）：后面不会再有浏览器下载
     // 事件来触发收尾，这里必须自己确认终态 —— 否则任务永远停在「下载中」。
     if (packs.length > 0) {
-      void chrome.runtime
-        .sendMessage({
-          type: 'ZIP_CLEANUP',
-          taskId: record.taskId,
-          dirName: packs[0]?.dirName ?? '',
-          packNames: packs.map((pack) => pack.name),
-        })
-        .catch(() => undefined);
+      cleanupPack(record, packs[0]?.dirName ?? '', [], false);
     }
     await checkFinished(record);
   }
 }
 
-/**
- * 打包的最后一个包落盘了：把条目标记完成，让后台页面把临时文件删掉。
- */
-async function finishPackTask(record: TaskRecord, dirName: string, packNames: string[]): Promise<void> {
-  for (const item of record.items) {
-    if (item.state !== 'downloading') continue;
+/** 这个任务还有包在打包或落盘吗（有的话，重试要等着 —— 两个包不能同时写同一个目录） */
+function packInFlight(record: TaskRecord): boolean {
+  return record.running.size > 0;
+}
+
+/** 包已经落盘：把这个包里的条目标成完成 */
+function completePackItems(record: TaskRecord, itemIds: string[]): void {
+  for (const itemId of itemIds) {
+    const item = record.items.find((x) => x.itemId === itemId);
+    if (!item || item.state !== 'downloading') continue;
     item.state = 'completed';
     item.speed = undefined;
     record.summary.completed += 1;
     record.dirty.add(item.itemId);
     bumpSessionStats(item.bytesReceived);
   }
-  record.queue = [];
-  await persist();
-  await broadcast(record, true);
-  // 让后台页面把 OPFS 里的临时包删掉（省磁盘）
+}
+
+/**
+ * 包没能落盘：只判这个包里的条目。
+ *
+ * 用户在下载栏点了「取消」是 `USER_CANCELED` —— 那是取消，不是失败：
+ * 逐文件下载那条路早就这么区分了，打包这条路以前把它记成失败，
+ * 界面上还会显示一串英文枚举。
+ */
+function settlePackItems(record: TaskRecord, itemIds: string[], error: string): void {
+  const cancelled = error === 'USER_CANCELED';
+  for (const itemId of itemIds) {
+    const item = record.items.find((x) => x.itemId === itemId);
+    if (!item || item.state !== 'downloading') continue;
+    item.state = cancelled ? 'cancelled' : 'failed';
+    item.error = cancelled ? undefined : error;
+    item.speed = undefined;
+    if (!cancelled) record.summary.failed += 1;
+    record.dirty.add(item.itemId);
+  }
+}
+
+/** 让后台页面把指定的临时包删掉（keepDir：另一个包还在读这个目录） */
+function cleanupPack(
+  record: TaskRecord,
+  dirName: string,
+  packNames: string[],
+  keepDir: boolean,
+): void {
   void chrome.runtime
-    .sendMessage({ type: 'ZIP_CLEANUP', taskId: record.taskId, dirName, packNames })
+    .sendMessage({ type: 'ZIP_CLEANUP', taskId: record.taskId, dirName, packNames, keepDir })
     .catch(() => undefined);
-  await checkFinished(record);
 }
 
 /**
@@ -829,48 +872,36 @@ async function poll(): Promise<void> {
     const info = infos.get(entry.downloadId);
     if (!info) continue;
 
-    // 打包模式：整批只有一次下载，它落盘了就是整批落盘了
+    // 打包模式：一条浏览器下载 = 一个包。包落盘只算**这个包里的**条目完成
     if (entry.itemId === ZIP_SLOT) {
+      const record = entry.record;
+      const delivery = record.packDeliveries?.get(info.id);
+      // SW 重启后内存里那张表就没了：退回「整批算这一个包」，别让条目永远停在下载中
+      const itemIds =
+        delivery?.itemIds ??
+        record.items.filter((i) => i.state === 'downloading').map((i) => i.itemId);
+      const dirName = delivery?.dirName ?? record.packFiles?.dirName ?? '';
+      const packNames = delivery ? [delivery.packName] : (record.packFiles?.packNames ?? []);
+
+      // 还在下载中就下一轮再看 —— 现在就把在途标记删掉，这个包就再也没人跟了
+      if (info.state !== 'complete' && info.state !== 'interrupted') continue;
+
+      record.running.delete(`d:${info.id}`);
+      const othersInFlight = packInFlight(record);
+
       if (info.state === 'complete') {
-        entry.record.running.delete(`d:${info.id}`);
-        const stillRunning = Array.from(entry.record.running.keys()).some((k) =>
-          k.startsWith('d:'),
-        );
-        if (!stillRunning && entry.record.engine === 'zip') {
-          const files = entry.record.packFiles;
-          await finishPackTask(
-            entry.record,
-            files?.dirName ?? '',
-            files?.packNames ?? [],
-          );
-        }
-      } else if (info.state === 'interrupted') {
-        entry.record.running.delete(`d:${info.id}`);
-        const error = info.error ?? '保存压缩包时中断了';
-        // 包没能存下来：临时文件留着就是垃圾，让后台页面删掉
-        // （正常交付完是 finishPackTask 去删的，这条路走不到那儿）
-        const files = entry.record.packFiles;
-        if (files) {
-          void chrome.runtime
-            .sendMessage({
-              type: 'ZIP_CLEANUP',
-              taskId: entry.record.taskId,
-              dirName: files.dirName,
-              packNames: files.packNames,
-            })
-            .catch(() => undefined);
-        }
-        for (const item of entry.record.items) {
-          if (item.state !== 'downloading') continue;
-          item.state = 'failed';
-          item.error = error;
-          item.speed = undefined;
-          entry.record.summary.failed += 1;
-          entry.record.dirty.add(item.itemId);
-        }
-        await broadcast(entry.record);
-        await checkFinished(entry.record);
+        completePackItems(record, itemIds);
+        cleanupPack(record, dirName, packNames, othersInFlight);
+      } else {
+        // 只判这一个包里的条目：别的包可能已经落盘或正在落盘，
+        // 一起判失败 + 一起删掉，用户就会「磁盘上有 zip，界面说全失败」
+        settlePackItems(record, itemIds, info.error ?? '保存压缩包时中断了');
+        cleanupPack(record, dirName, packNames, othersInFlight);
       }
+
+      await persist();
+      await broadcast(record, true);
+      if (!othersInFlight) await checkFinished(record);
       continue;
     }
 
@@ -1126,6 +1157,15 @@ export async function retryItem(taskId: string, itemId: string): Promise<StartRe
 
   const source = record.sources.get(itemId);
   if (!source) return { waiting: false };
+
+  if (record.engine === 'zip' && packInFlight(record)) {
+    // 打包模式没法往正在打的包里补文件；这时候再起一个包，两个包会写同一个
+    // OPFS 目录、互相截断，最后整批结果都丢。所以先拒绝，等这一批交付完。
+    item.error = '这一批还在打包/保存，等它结束再重试';
+    record.dirty.add(itemId);
+    await broadcast(record, true);
+    return { waiting: false };
+  }
 
   item.state = 'queued';
   item.bytesReceived = 0;

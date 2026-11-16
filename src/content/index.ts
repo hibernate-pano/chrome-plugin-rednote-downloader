@@ -1,5 +1,5 @@
 import { PageBridge } from './bridge';
-import { Detector, classifyPage, type PageKind } from './detect/detector';
+import { Detector, classifyPage, routeKey, type PageKind } from './detect/detector';
 import { buildRelativePath, fileNameForItem } from './detect/media';
 import type { RawNoteRef } from './detect/raw';
 import { MSG } from '../shared/messages';
@@ -73,7 +73,12 @@ class App {
   };
   private batchTaskId: string | undefined;
   private noteTaskId: string | undefined;
-  private scanned = false;
+  /** 当前路由身份（`note:<id>` / `profile:<id>` / `unknown`），query 变化不算换页 */
+  private routeKey = '';
+  /** 主页扫描的代数：每次重置 +1，旧扫描的结果一律丢弃 */
+  private scanSeq = 0;
+  /** 正在跑的那次扫描的取消位（「停止扫描」要真的停手） */
+  private scanAbort: AbortController | null = null;
   /** 本次页面会话是否已经发起过主页扫描（避免重复触发） */
   private batchStarted = false;
   /** 文件类型筛选：决定「下载哪些文件」 */
@@ -138,6 +143,12 @@ class App {
       const next = changes['rednote.settings']?.newValue as Partial<Settings> | undefined;
       if (!next) return;
       this.applySettings({ ...this.settings, ...next });
+      // 光把新设置塞进字段不够：面板上的文件名是渲染时算好写死的，
+      // 页签/主题也是。不重绘的话，看到的是旧模板算出的名字，落盘的却是新模板 ——
+      // 这正是「所见即所得」要避免的事。
+      this.panel.setTheme(this.settings.theme);
+      if (this.pageKind === 'note') this.renderNote();
+      else if (this.pageKind === 'profile') this.panel.renderBatch(this.batch);
     });
 
     chrome.runtime.onMessage.addListener((message: any, _sender, sendResponse) => {
@@ -184,13 +195,17 @@ class App {
     // 站点初始化时会 replaceState 一次，路径没变就别重识别。
     // 否则面板会被清空重建 —— 用户正好在这几秒里点下载，
     // 按钮已经不在了，就是一次静默无响应（这是最难查的那种失败）。
-    if (path === this.currentPath) return;
+    //
+    // 比对的是**带 id 的路由身份**，不是 PageKind：
+    // 「账号 A 主页 → 账号 B 主页」kind 都是 profile，只比 kind 会把 A 的结果留给 B，
+    // 而下载用的是 A 的 noteId —— 用户会以为自己下的是 B。
+    const nextKey = routeKey(path);
+    if (nextKey === this.routeKey) return;
+    this.routeKey = nextKey;
     this.currentPath = path;
 
     const kind = classifyPage(path);
-    if (kind === this.pageKind && this.scanned) return;
     this.pageKind = kind;
-    this.scanned = false;
 
     if (kind === 'note') {
       this.panel.setMode('note');
@@ -201,7 +216,17 @@ class App {
       this.panel.setFabBadge(0);
       this.panel.renderBatch(this.batch);
     } else {
+      // 首页信息流 / 搜索页之类：面板里那篇笔记已经不在这页上了。
+      // 只把徽标清零是不够的 —— 面板再打开时还是上一篇的标题和下载按钮，
+      // 点下去会把用户早就离开的那篇笔记重新下一遍。
+      this.detectToken += 1; // 在途的识别别把结果写回来
+      this.note = null;
+      this.noteError = undefined;
+      this.noteDetecting = false;
+      this.resetBatch();
       this.panel.setFabBadge(0);
+      this.panel.close();
+      this.renderNote();
     }
   }
 
@@ -306,6 +331,8 @@ class App {
   private async setMediaFilter(filter: MediaFilter): Promise<void> {
     if (this.mediaFilter === filter) return;
     this.applySettings({ ...this.settings, downloadFilter: filter });
+    // 上一轮的「全部下载完成」是那一批的结论；改了筛选，用户要看的是「这次会下什么」
+    if (this.batch.phase === 'completed') this.batch.phase = 'ready';
 
     // 先重绘，让筛选立刻生效；存设置失败也不影响本次使用
     if (this.pageKind === 'note') this.renderNote();
@@ -327,6 +354,7 @@ class App {
   private async setSaveStructure(structure: SaveStructure): Promise<void> {
     if (this.saveStructure === structure) return;
     this.applySettings({ ...this.settings, saveStructure: structure });
+    if (this.batch.phase === 'completed') this.batch.phase = 'ready';
 
     if (this.pageKind === 'note') this.renderNote();
     else this.panel.renderBatch(this.batch);
@@ -343,6 +371,10 @@ class App {
   /* --------------------------- 主页批量 --------------------------- */
 
   private resetBatch(): void {
+    // 旧扫描立刻停手：它交回来的结果是上一个账号（或上一次扫描）的卡片
+    this.scanAbort?.abort();
+    this.scanAbort = null;
+    this.scanSeq += 1;
     this.batch = {
       phase: 'scanning',
       cards: [],
@@ -359,17 +391,26 @@ class App {
 
   private async startScan(): Promise<void> {
     this.resetBatch();
+    const seq = this.scanSeq;
+    const abort = new AbortController();
+    this.scanAbort = abort;
     this.batchStarted = true;
-    this.scanned = true;
     this.panel.setMode('batch');
     this.panel.open();
     this.panel.renderBatch(this.batch);
 
+    // 路由变了 / 被新一次扫描取代 ⇒ 这次的结果不许再往面板上写
+    const stale = () => seq !== this.scanSeq || this.pageKind !== 'profile';
+
     try {
       const result = await this.detector.scanProfile((info) => {
+        if (stale()) return;
         this.batch.scanInfo = info;
         this.panel.renderBatch(this.batch);
-      });
+      }, abort.signal);
+
+      if (stale()) return;
+      if (this.scanAbort === abort) this.scanAbort = null;
 
       if (result.blocked) {
         this.batch.phase = 'blocked';
@@ -380,13 +421,23 @@ class App {
 
       this.batch.phase = 'ready';
       this.batch.scanInfo = { found: result.refs.length, rounds: result.rounds };
+      this.batch.scanStopped = result.stopped === true;
       this.batch.cards = result.refs.map((ref) => {
         if (ref.xsecToken) this.xsecTokens.set(ref.noteId, ref.xsecToken);
         return this.toCard(ref);
       });
       this.panel.setFabBadge(this.batch.cards.length);
       this.panel.renderBatch(this.batch);
+      if (result.stopped) {
+        this.toast.info(
+          '已停止扫描',
+          this.batch.cards.length > 0
+            ? `已找到 ${this.batch.cards.length} 条笔记，可以继续选择下载`
+            : '这次一条都还没扫到',
+        );
+      }
     } catch (err) {
+      if (stale()) return;
       this.batch.phase = 'error';
       this.batch.error = err instanceof Error ? err.message : '网络异常，请稍后再试。';
       this.panel.renderBatch(this.batch);
@@ -405,10 +456,12 @@ class App {
     };
   }
 
-  private async stopScan(): Promise<void> {
-    this.batch.phase = 'ready';
-    this.panel.renderBatch(this.batch);
-    this.toast.info('已停止扫描', '已发现的内容仍然可以下载');
+  /**
+   * 停止扫描：真的让扫描停手（滚动的循环会立刻退出），
+   * 由 startScan 用已经扫到的那部分结账 —— 不是先弹一句「没找到」再自己填满。
+   */
+  private stopScan(): void {
+    this.scanAbort?.abort();
   }
 
   private async rescan(): Promise<void> {
@@ -541,6 +594,8 @@ class App {
     }
 
     this.batchTaskId = shortId('t');
+    // 新一批开工：把上一次的「全部完成」收起来，否则页脚一直挂着上一轮的结论
+    this.batch.phase = 'ready';
     this.panel.renderBatch(this.batch);
     const started = await chrome.runtime.sendMessage({
       type: MSG.START_DOWNLOADS,
@@ -680,14 +735,24 @@ class App {
     await chrome.runtime.sendMessage({ type: 'SHOW_DOWNLOADS' });
   }
 
+  /**
+   * 「取消 / 重试」要打到**面板当前显示的那个任务**上。
+   *
+   * 以前写死 `batchTaskId ?? noteTaskId`：在主页批量下过一次、再点进某篇笔记下载，
+   * 面板上的「取消」发的是那个早就结束的批量任务，后台没有在跑的条目 ⇒ 按了没反应。
+   */
+  private activeTaskId(): string | undefined {
+    return this.panel.currentMode === 'batch' ? this.batchTaskId : this.noteTaskId;
+  }
+
   private async retry(itemId: string): Promise<void> {
-    const taskId = this.batchTaskId ?? this.noteTaskId;
+    const taskId = this.activeTaskId();
     if (!taskId) return;
     await chrome.runtime.sendMessage({ type: MSG.RETRY_TASK_ITEM, taskId, itemId });
   }
 
   private async cancelTask(): Promise<void> {
-    const taskId = this.batchTaskId ?? this.noteTaskId;
+    const taskId = this.activeTaskId();
     if (!taskId) return;
     await chrome.runtime.sendMessage({ type: MSG.CANCEL_TASK, taskId });
   }
@@ -716,6 +781,12 @@ class App {
 
     this.panel.setFabBackgroundProgress(running > 0 || settled < total ? pct : null);
 
+    // 上一轮已经报过「全部完成」，这次又开工了（点了重试）：页脚先回到进行中
+    if (running > 0 && this.batch.phase === 'completed') {
+      this.batch.phase = 'ready';
+      this.panel.refreshBatchFooter(this.batch);
+    }
+
     // 只补变化的那几行 / 那几张卡，不整块重画 ——
     // 整块重画会把几十张卡片的缩略图反复重建，主线程会明显卡顿
     this.panel.patchProgress(list);
@@ -728,6 +799,13 @@ class App {
 
     if (running === 0 && total > 0 && settled === total) {
       this.panel.setFabBackgroundProgress(null);
+      // 批量模式的收尾：面板要给出「全部下载完成 / 重试失败项 / 下载列表」。
+      // 以前 phase 永远是 'ready'，这段页脚在批量模式下从来没出现过，
+      // 而失败 toast 写着「点击可在面板中重试」，点开却没有那个按钮。
+      if (this.batchTaskId && this.batch.phase === 'ready' && taskIds.has(this.batchTaskId)) {
+        this.batch.phase = 'completed';
+        this.panel.refreshBatchFooter(this.batch);
+      }
       // 同一批进度会重复广播（完成一条 → 收尾 → 全量再同步一次），
       // 每条都是「全部结束」。同一个任务只报一次。
       //

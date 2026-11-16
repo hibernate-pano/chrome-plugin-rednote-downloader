@@ -17,9 +17,24 @@ export type PageKind = 'note' | 'profile' | 'unknown';
 const NOTE_DETAIL_TIMEOUT_MS = 26000;
 
 export function classifyPage(path: string): PageKind {
-  if (/\/explore\/[A-Za-z0-9_-]+/i.test(path)) return 'note';
-  if (/\/discovery\/item\/[A-Za-z0-9_-]+/i.test(path)) return 'note';
-  if (/\/user\/profile\/[A-Za-z0-9_-]+/i.test(path)) return 'profile';
+  const key = routeKey(path);
+  if (key.startsWith('note:')) return 'note';
+  if (key.startsWith('profile:')) return 'profile';
+  return 'unknown';
+}
+
+/**
+ * 路由身份：`note:<id>` / `profile:<id>` / `unknown`。
+ *
+ * **必须带上 id**：只看 PageKind 的话，「账号 A 的主页 → 账号 B 的主页」是同一个 kind，
+ * 面板会继续显示 A 的扫描结果，而下载用的是 A 的 noteId —— 用户会以为自己下的是 B。
+ * query 变化（xsec_token 刷新、主页里的 tab）不算换页。
+ */
+export function routeKey(path: string): string {
+  const note = path.match(/\/(?:explore|discovery\/item)\/([A-Za-z0-9_-]+)/i)?.[1];
+  if (note) return `note:${note}`;
+  const profile = path.match(/\/user\/profile\/([A-Za-z0-9_-]+)/i)?.[1];
+  if (profile) return `profile:${profile}`;
   return 'unknown';
 }
 
@@ -31,6 +46,8 @@ export interface ProfileScan {
   /** 站点没有返回笔记 id —— 通常意味着需要登录 */
   blocked?: boolean;
   blockedReason?: string;
+  /** 用户按了「停止扫描」：refs 是停手时已经扫到的部分，不是完整列表 */
+  stopped?: boolean;
 }
 
 export interface DetectDeps {
@@ -175,6 +192,7 @@ export class Detector {
 
   async scanProfile(
     onProgress?: (info: { found: number; rounds: number }) => void,
+    signal?: AbortSignal,
   ): Promise<ProfileScan> {
     const { bridge, getSettings } = this.deps;
     const settings = getSettings();
@@ -184,7 +202,7 @@ export class Detector {
     onProgress?.({ found: refs.length, rounds });
 
     // 主页刚打开时列表还没渲染出来 —— 先等站点数据就绪，别急着下结论
-    if (refs.length === 0) {
+    if (refs.length === 0 && !signal?.aborted) {
       await this.deps.bridge.waitForStateReady(6000);
       refs = await this.collectRefs();
       onProgress?.({ found: refs.length, rounds });
@@ -192,7 +210,7 @@ export class Detector {
 
     // 页面上明明有卡片，却一条笔记 id 都拿不到 —— 这是小红书未登录时的限制。
     // 再怎么滚也不会冒出 id，所以直接告诉用户，别让人对着转圈等半分钟。
-    if (refs.length === 0 && this.countProfileCards() > 0) {
+    if (refs.length === 0 && !signal?.aborted && this.countProfileCards() > 0) {
       const domCards = this.countProfileCards();
       return {
         refs: [],
@@ -202,14 +220,18 @@ export class Detector {
       };
     }
 
-    if (settings.autoScrollScan) {
+    // 用户点了「停止扫描」⇒ 立刻停手，把已经扫到的条目交回去。
+    // 以前这里没有取消位：按了停止，页面还会自己往下滚几十秒，
+    // 面板上先弹一句「没有找到可下载的笔记」的假结论，然后网格又自己填满。
+    if (settings.autoScrollScan && !signal?.aborted) {
       const maxRounds = Math.max(1, settings.maxScrollRounds);
       let stagnant = 0;
       // 至少滚满 3 轮再判断「到底了」，否则页面还没加载完就提前收工
-      while (rounds < maxRounds && (rounds < 3 || stagnant < 2)) {
+      while (!signal?.aborted && rounds < maxRounds && (rounds < 3 || stagnant < 2)) {
         const before = refs.length;
         await this.scrollToBottom();
         await sleep(700);
+        if (signal?.aborted) break;
         refs = await this.collectRefs();
         rounds += 1;
         stagnant = refs.length > before ? 0 : stagnant + 1;
@@ -219,17 +241,19 @@ export class Detector {
     }
 
     // 借助站点自己的分页接口再翻几页（游客态下会被服务端截断，登录后才有完整数据）
-    try {
-      const res = await bridge.call<{ ok: boolean; notes?: any[] }>('profile.fetchMore', {
-        rounds: Math.min(12, settings.maxScrollRounds),
-      });
-      if (res?.ok && Array.isArray(res.notes)) {
-        refs = refs.concat(this.refsFromFeedItems(res.notes));
-        rounds += 1;
-        onProgress?.({ found: refs.length, rounds });
+    if (!signal?.aborted) {
+      try {
+        const res = await bridge.call<{ ok: boolean; notes?: any[] }>('profile.fetchMore', {
+          rounds: Math.min(12, settings.maxScrollRounds),
+        });
+        if (res?.ok && Array.isArray(res.notes)) {
+          refs = refs.concat(this.refsFromFeedItems(res.notes));
+          rounds += 1;
+          onProgress?.({ found: refs.length, rounds });
+        }
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
     }
 
     // 合并去重
@@ -268,7 +292,7 @@ export class Detector {
       };
     }
 
-    return { refs: result, rounds };
+    return { refs: result, rounds, stopped: signal?.aborted === true };
   }
 
   /** 主页上渲染出来的笔记卡片数量（用来区分「账号没笔记」和「游客态受限」） */

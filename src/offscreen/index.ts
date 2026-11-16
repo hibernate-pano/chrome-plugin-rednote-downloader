@@ -60,6 +60,7 @@ async function handleStart(message: Extract<WorkerToOffscreen, { type: 'ZIP_STAR
       downloadPath: string;
       bytes: number;
       entries: number;
+      itemIds: string[];
     }[] = [];
     const handles: { url: string; dirName: string; name: string }[] = [];
 
@@ -72,6 +73,9 @@ async function handleStart(message: Extract<WorkerToOffscreen, { type: 'ZIP_STAR
 
       const objectUrl = await createPackUrl(dirName, pack.name);
       if (!objectUrl) {
+        // 前面几个包的 blob: 地址已经建出来了 —— 不撤销的话，
+        // 它们会一直钉住 OPFS 里的文件，直到后台页面被回收
+        revokeHandles(handles);
         report({ type: 'ZIP_FAILED', taskId, error: '打包文件读取失败' });
         return;
       }
@@ -83,6 +87,7 @@ async function handleStart(message: Extract<WorkerToOffscreen, { type: 'ZIP_STAR
         downloadPath,
         bytes: pack.bytes,
         entries: pack.entries,
+        itemIds: pack.itemIds,
       });
     }
 
@@ -108,14 +113,8 @@ async function createPackUrl(dirName: string, packName: string): Promise<string 
   }
 }
 
-/** 下载完了：把临时的包和地址都清掉 */
-async function handleCleanup(message: Extract<WorkerToOffscreen, { type: 'ZIP_CLEANUP' }>): Promise<void> {
-  const { taskId, dirName, packNames } = message;
-  for (const name of packNames) await removePack(dirName, name);
-  // 目录本身也删掉 —— 一个任务一个目录（pack-<taskId>），
-  // 包删完之后留着个空目录也是垃圾，攒多了 OPFS 就没法看了
-  if (dirName) await removePackDir(dirName);
-  const handles = delivered.get(taskId) ?? [];
+/** 撤销一批 blob: 地址（后台页面被回收前，这些地址会一直钉住文件） */
+function revokeHandles(handles: { url: string }[]): void {
   for (const handle of handles) {
     try {
       URL.revokeObjectURL(handle.url);
@@ -123,6 +122,17 @@ async function handleCleanup(message: Extract<WorkerToOffscreen, { type: 'ZIP_CL
       /* ignore */
     }
   }
+}
+
+/** 下载完了：把临时的包和地址都清掉 */
+async function handleCleanup(message: Extract<WorkerToOffscreen, { type: 'ZIP_CLEANUP' }>): Promise<void> {
+  const { taskId, dirName, packNames, keepDir } = message;
+  for (const name of packNames) await removePack(dirName, name);
+  // 目录本身也删掉 —— 一个任务一个目录（pack-<taskId>），
+  // 包删完之后留着个空目录也是垃圾，攒多了 OPFS 就没法看了。
+  // 多包场景下只删掉的那一个包时不能删目录：另一个包还在读它。
+  if (dirName && !keepDir) await removePackDir(dirName);
+  revokeHandles(delivered.get(taskId) ?? []);
   delivered.delete(taskId);
 }
 
@@ -142,14 +152,7 @@ async function handleCancel(taskId: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   await removePackDir(`pack-${taskId}`);
-  const handles = delivered.get(taskId) ?? [];
-  for (const handle of handles) {
-    try {
-      URL.revokeObjectURL(handle.url);
-    } catch {
-      /* ignore */
-    }
-  }
+  revokeHandles(delivered.get(taskId) ?? []);
   delivered.delete(taskId);
 }
 

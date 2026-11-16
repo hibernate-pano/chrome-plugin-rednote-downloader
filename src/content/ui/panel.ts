@@ -61,6 +61,8 @@ export interface BatchViewModel {
   avatar?: string;
   phase: BatchPhase;
   scanInfo?: { found: number; rounds: number };
+  /** 扫描是被「停止扫描」中断的：结果只是扫到的那一部分，别当成「这个账号没有笔记」 */
+  scanStopped?: boolean;
   /**
    * 这一批内容是用哪条路解析出来的。
    *
@@ -532,6 +534,11 @@ export class Panel {
     this.position();
   }
 
+  /** 面板现在显示的是哪一套内容（决定「取消 / 重试」该打到哪个任务上） */
+  get currentMode(): 'note' | 'batch' {
+    return this.mode;
+  }
+
   /** 渲染单篇面板 */
   renderNote(vm: NoteViewModel): void {
     this.preserveScroll(() => this.renderNoteInner(vm));
@@ -573,6 +580,9 @@ export class Panel {
     // 用户正要点的下载按钮会突然消失，那就是一次静默无响应
     if (vm.detecting && !vm.note) {
       this.body.appendChild(this.buildScanState('正在识别当前笔记…', '正在读取页面中的图片与视频信息'));
+      // 页脚必须跟着这一帧重画：留着上一篇的「全部下载 (N)」，
+      // 按钮的闭包还持有上一篇的文件，点下去会把上一篇再下一遍
+      this.renderNoteFooter(vm);
       return;
     }
     if (vm.error && !vm.note) {
@@ -585,6 +595,7 @@ export class Panel {
           ],
         }),
       );
+      this.renderNoteFooter(vm);
       return;
     }
     if (!vm.note || vm.note.items.length === 0) {
@@ -597,6 +608,7 @@ export class Panel {
           ],
         }),
       );
+      this.renderNoteFooter(vm);
       return;
     }
 
@@ -982,9 +994,9 @@ export class Panel {
   private renderBatchInner(vm: BatchViewModel): void {
     this.lastBatchVm = vm;
     this.mode = 'batch';
-    // 只有「就绪」状态才有工具条 —— 扫描中/被拦/出错时留着上一帧的页签，
-    // 用户会以为还能筛点什么
-    this.toolbar.hidden = vm.phase !== 'ready';
+    // 只有「就绪 / 已完成」状态才有工具条 —— 扫描中/被拦/出错时留着上一帧的页签，
+    // 用户会以为还能筛点什么；而下载完成后筛选项还要能用（接着挑别的下）
+    this.toolbar.hidden = vm.phase !== 'ready' && vm.phase !== 'completed';
     this.footer.hidden = false;
 
     /* Header */
@@ -1068,15 +1080,22 @@ export class Panel {
     }
 
     if (vm.cards.length === 0) {
+      // 用户自己按了「停止扫描」时不能说「这个账号没有笔记」—— 那是在替用户下结论
       this.body.appendChild(
-        this.buildEmptyState({
-          title: '没有找到可下载的笔记',
-          body: '这个账号的笔记可能全部设为私密，或者需要登录后才能查看。',
-          actions: [
-            { label: '登录小红书后重试', variant: 'primary', onClick: () => this.callbacks.onLogin() },
-            { label: '重新扫描', onClick: () => this.callbacks.onRescan() },
-          ],
-        }),
+        vm.scanStopped
+          ? this.buildEmptyState({
+              title: '扫描已停止',
+              body: '停手的时候还没扫到笔记。可以重新扫描一次。',
+              actions: [{ label: '重新扫描', variant: 'primary', onClick: () => this.callbacks.onRescan() }],
+            })
+          : this.buildEmptyState({
+              title: '没有找到可下载的笔记',
+              body: '这个账号的笔记可能全部设为私密，或者需要登录后才能查看。',
+              actions: [
+                { label: '登录小红书后重试', variant: 'primary', onClick: () => this.callbacks.onLogin() },
+                { label: '重新扫描', onClick: () => this.callbacks.onRescan() },
+              ],
+            }),
       );
       this.renderBatchFooter(vm);
       return;
@@ -1439,6 +1458,12 @@ export class Panel {
     this.renderBatchFooter(vm);
   }
 
+  /** 只重画批量页脚（收尾时用：重画整张网格会让几百张缩略图重新解码） */
+  refreshBatchFooter(vm: BatchViewModel): void {
+    if (this.mode !== 'batch') return;
+    this.renderBatchFooter(vm);
+  }
+
   private renderBatchFooter(vm: BatchViewModel): void {
     this.footer.innerHTML = '';
     const info = el('div', 'rn-footer-info');
@@ -1498,6 +1523,9 @@ export class Panel {
         });
         this.footer.appendChild(retry);
       }
+      // 这一批收工了，但用户可能还要换个筛选再下一轮 ——
+      // 「开始下载」不能跟着消失，否则改完筛选只能重新扫描
+      this.appendBatchActions(vm, selectedCards);
       return;
     }
 
@@ -1544,6 +1572,11 @@ export class Panel {
       this.footer.appendChild(cancel);
     }
 
+    this.appendBatchActions(vm, selectedCards);
+  }
+
+  /** 批量页脚的操作按钮（就绪态与完成态共用：完成之后还能接着挑别的下） */
+  private appendBatchActions(vm: BatchViewModel, selectedCards: BatchCard[]): void {
     if (selectedCards.length > 0) {
       const clear = el('button', 'rn-btn');
       clear.type = 'button';
