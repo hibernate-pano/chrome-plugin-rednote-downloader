@@ -77,12 +77,36 @@ function installBrowserStubs(): void {
   });
 }
 
-/** fetch 替身：URL 里带 bad 的返回 500，其余返回一小段内容 */
+/**
+ * fetch 替身：URL 里带 bad 的返回 500，带 empty 的返回 200 + 空 body，
+ * 带 short 的声明了更大的 content-length 却只给一半，其余返回一小段内容。
+ */
 function installFetchStub(): void {
   globalThis.fetch = (async (input: unknown) => {
     const url = String(input);
     if (url.includes('bad')) {
       return { ok: false, status: 500, headers: { get: () => null }, body: null };
+    }
+    if (url.includes('empty')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (name: string) => (name === 'content-length' ? '0' : null) },
+        body: null,
+        arrayBuffer: async () => new ArrayBuffer(0),
+      };
+    }
+    if (url.includes('short')) {
+      const partial = new TextEncoder().encode(`half-of-${url}`);
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name: string) => (name === 'content-length' ? String(partial.byteLength * 2) : null),
+        },
+        body: null,
+        arrayBuffer: async () => partial.buffer,
+      };
     }
     const data = new TextEncoder().encode(`body-of-${url}`);
     return {
@@ -194,4 +218,58 @@ test('打包：全部成功时包里的顺序与下载完成顺序无关', async
   assert.deepEqual(result.failed, []);
   assert.deepEqual(zipEntryNames(packBytes('pack-all-ok').bytes), ['x.jpg', 'y.jpg', 'z.jpg']);
   assert.equal(result.packs[0]?.entries, 3);
+});
+
+test('打包：CDN 回了 200 但是空 body，不能当成功写进包', async () => {
+  installBrowserStubs();
+  installFetchStub();
+  const { packIntoOpfs } = await import('../src/offscreen/pack');
+
+  const result = await packIntoOpfs({
+    items: [item('a', 'https://cdn/a.jpg'), item('e', 'https://cdn/empty.jpg')],
+    dirName: 'pack-empty-body',
+    concurrency: 2,
+    maxZipBytes: 64 * 1024 * 1024,
+    signal: new AbortController().signal,
+  });
+
+  assert.deepEqual(
+    result.failed.map((f) => f.itemId),
+    ['e'],
+    '空响应必须当失败报出来 —— 包里塞个 0 字节的文件，用户解压后才发现',
+  );
+  assert.deepEqual(zipEntryNames(packBytes('pack-empty-body').bytes), ['a.jpg']);
+});
+
+test('打包：响应比声明的 content-length 短（连接断了），不能当成功', async () => {
+  installBrowserStubs();
+  installFetchStub();
+  const { packIntoOpfs } = await import('../src/offscreen/pack');
+
+  const result = await packIntoOpfs({
+    items: [item('a', 'https://cdn/a.jpg'), item('s', 'https://cdn/short.jpg')],
+    dirName: 'pack-short-body',
+    concurrency: 2,
+    maxZipBytes: 64 * 1024 * 1024,
+    signal: new AbortController().signal,
+  });
+
+  assert.deepEqual(result.failed.map((f) => f.itemId), ['s']);
+  assert.deepEqual(zipEntryNames(packBytes('pack-short-body').bytes), ['a.jpg']);
+});
+
+test('打包：包要记住自己装了哪些条目（交付时只判这个包）', async () => {
+  installBrowserStubs();
+  installFetchStub();
+  const { packIntoOpfs } = await import('../src/offscreen/pack');
+
+  const result = await packIntoOpfs({
+    items: [item('a', 'https://cdn/a.jpg'), item('b', 'https://cdn/b.jpg')],
+    dirName: 'pack-members',
+    concurrency: 2,
+    maxZipBytes: 64 * 1024 * 1024,
+    signal: new AbortController().signal,
+  });
+
+  assert.deepEqual(result.packs[0]?.itemIds, ['a', 'b']);
 });

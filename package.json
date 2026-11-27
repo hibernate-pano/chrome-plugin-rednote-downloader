@@ -1,6 +1,6 @@
 {
   "name": "rednote-downloader",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "小红书内容下载器 — Chrome 扩展",
   "type": "module",
@@ -21,7 +21,7 @@
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",
-    "esbuild": "^0.24.2",
+    "esbuild": "^0.25.12",
     "typescript": "^5.7.2"
   }
 }

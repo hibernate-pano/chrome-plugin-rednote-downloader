@@ -14,10 +14,20 @@
  * 内存占用：
  * 下载是并行的（网络是瓶颈），但 zip 是顺序结构，写入必须串行。
  * 所以每个下载线程先把文件收进内存，写入线程按顺序取走。
- * 峰值内存 ≈ 并发数 × 单个文件大小。几百兆的视频配 3 个并发是可控的。
+ * 队列按**字节**设了上限（见 MAX_BUFFERED_BYTES）：第 1 项是个慢的大文件时，
+ * 后面 299 个下完的文件会排在它后面等着，不设上限就是无界内存 ——
+ * 后台页面被 OOM 杀掉，任务永远停在「下载中」。
  */
 
 import { ZipWriter, type ZipSink } from '../background/zip';
+
+/**
+ * 排队等着写进包的数据上限。
+ *
+ * 写入线程必须按序号写：第 1 项慢，后面下完的都只能等着。
+ * 上限一到，下载线程就停下来等写入线程消费 —— 用一点吞吐换「不会被 OOM 杀掉」。
+ */
+const MAX_BUFFERED_BYTES = 256 * 1024 * 1024;
 
 /** 待打包的一个文件 */
 export interface PackItem {
@@ -54,6 +64,8 @@ export interface PackFile {
   bytes: number;
   /** 装了几个文件 */
   entries: number;
+  /** 装了哪些条目：交付失败时只判这些失败，不连累别的包 */
+  itemIds: string[];
 }
 
 export interface PackResult {
@@ -182,12 +194,15 @@ async function download(
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
   const header = Number(response.headers.get('content-length'));
+  // 有 content-encoding 时 content-length 是压缩后的大小，跟解出来的字节对不上
+  const encoded = Boolean(response.headers.get('content-encoding'));
   const total = header > 0 ? header : (item.size ?? -1);
 
   const body = response.body;
   if (!body) {
     const data = new Uint8Array(await response.arrayBuffer());
     onProgress?.(data.byteLength, total > 0 ? total : data.byteLength);
+    assertComplete(data.byteLength, header, encoded);
     return data;
   }
 
@@ -203,6 +218,8 @@ async function download(
     onProgress?.(received, total);
   }
 
+  assertComplete(received, header, encoded);
+
   const data = new Uint8Array(received);
   let at = 0;
   for (const chunk of chunks) {
@@ -210,6 +227,20 @@ async function download(
     at += chunk.byteLength;
   }
   return data;
+}
+
+/**
+ * 空响应 / 截断的响应不能当成功写进包里。
+ *
+ * 逐文件下载那条路早就有这道防线（`fileSize === 0` 判失败），
+ * 打包这条路漏了：CDN 对过期直链回 200 + 空 body 时，
+ * 包里会出现 0 字节的文件，面板却报「已完成」。
+ */
+function assertComplete(received: number, header: number, encoded: boolean): void {
+  if (received === 0) throw new Error('服务器返回了空文件');
+  if (!encoded && header > 0 && received < header) {
+    throw new Error(`只收到 ${received} / ${header} 字节（连接中途断了）`);
+  }
 }
 
 /**
@@ -243,6 +274,26 @@ export async function packIntoOpfs(options: PackOptions): Promise<PackResult> {
   const failed: PackResult['failed'] = [];
   const packs: PackFile[] = [];
 
+  // 队列里压着多少字节还没写进包
+  let bufferedBytes = 0;
+  // 可能有多个下载线程同时被挡住，都得能醒过来（只存一个会让其它的永远挂着）
+  let drainWaiters: Array<() => void> = [];
+
+  const releaseIfDrained = (): void => {
+    if (bufferedBytes > MAX_BUFFERED_BYTES) return;
+    const waiters = drainWaiters;
+    drainWaiters = [];
+    for (const wake of waiters) wake();
+  };
+
+  /** 排队的数据太多就让下载线程先停一停，等写入线程追上 */
+  const awaitCapacity = async (): Promise<void> => {
+    if (bufferedBytes <= MAX_BUFFERED_BYTES || signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      drainWaiters.push(resolve);
+    });
+  };
+
   let cursor = 0;
   const worker = async (): Promise<void> => {
     for (;;) {
@@ -256,7 +307,9 @@ export async function packIntoOpfs(options: PackOptions): Promise<PackResult> {
         const data = await download(item, signal, (received, total) =>
           options.onItemProgress?.(item.itemId, received, total),
         );
+        bufferedBytes += data.byteLength;
         queue.push(index, { item, data });
+        await awaitCapacity();
       } catch (err) {
         if (signal.aborted) return;
         const message = errorText(err);
@@ -286,12 +339,21 @@ export async function packIntoOpfs(options: PackOptions): Promise<PackResult> {
     writer = new ZipWriter(new OpfsSink(stream));
   };
 
+  // 当前这个包里装了哪些条目：交付失败时只判这些失败，不连累别的包
+  let currentItemIds: string[] = [];
+
   const closePack = async (): Promise<void> => {
     if (!writer || !stream) return;
     const summary = await writer.finish();
     const bytes = writer.totalBytes;
     await stream.close();
-    packs.push({ name: `pack-${packIndex + 1}.zip`, bytes, entries: summary.entries });
+    packs.push({
+      name: `pack-${packIndex + 1}.zip`,
+      bytes,
+      entries: summary.entries,
+      itemIds: currentItemIds,
+    });
+    currentItemIds = [];
     writer = undefined;
     stream = undefined;
     packIndex += 1;
@@ -304,6 +366,8 @@ export async function packIntoOpfs(options: PackOptions): Promise<PackResult> {
       if (signal.aborted) break;
       // 这一项没下载成功：序号已经推进，跳过它，后面的文件照写
       if (!entry.data) continue;
+      bufferedBytes -= entry.data.byteLength;
+      releaseIfDrained();
 
       if (!writer) await openPack();
 
@@ -318,10 +382,12 @@ export async function packIntoOpfs(options: PackOptions): Promise<PackResult> {
       const target = writer;
       if (!target) break;
       await target.addFile(entry.item.path, [entry.data]);
+      currentItemIds.push(entry.item.itemId);
       options.onItemDone?.(entry.item.itemId, entry.data.byteLength);
     }
   } finally {
     queue.close();
+    releaseIfDrained(); // 别让被挡住的下载线程永远挂着
     await Promise.allSettled(workers);
   }
 

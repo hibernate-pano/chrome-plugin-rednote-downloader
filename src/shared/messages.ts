@@ -47,8 +47,13 @@ export type WorkerToOffscreen =
       rootFolder: string;
     }
   | { type: 'ZIP_CANCEL'; taskId: string }
-  /** 下载完了，把临时的包删掉（省磁盘） */
-  | { type: 'ZIP_CLEANUP'; taskId: string; dirName: string; packNames: string[] };
+  /**
+   * 下载完了，把临时的包删掉（省磁盘）。
+   *
+   * `keepDir`：只删指定的包、留着目录。多包场景下一条下载失败，
+   * 另一个包可能还在读同一个目录里的文件 —— 把目录整个删了会连着把它废掉。
+   */
+  | { type: 'ZIP_CLEANUP'; taskId: string; dirName: string; packNames: string[]; keepDir?: boolean };
 
 /** 后台页面 → service worker */
 export type OffscreenToWorker =
@@ -78,6 +83,8 @@ export type OffscreenToWorker =
         downloadPath: string;
         bytes: number;
         entries: number;
+        /** 这个包里装了哪些条目 —— 一条下载失败时只判这些失败 */
+        itemIds: string[];
       }[];
     }
   | { type: 'ZIP_FAILED'; taskId: string; error: string };

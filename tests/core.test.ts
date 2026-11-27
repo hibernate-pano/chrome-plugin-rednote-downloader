@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import { sanitizeSegment, sanitizeStem, buildSafeFileName, renderTemplate, guessExtension, formatBytes, matchesMediaFilter, filterByMediaFilter, mediaFilterLabel, effectiveTemplate, saveStructureLabel, saveStructureName } from '../src/shared/utils';
 import { originalImageUrl, jpegImageUrl, extractNote, extractNoteFromState, findNoteInPayload, hasMedia, parseInitialState, titleFromDesc } from '../src/content/detect/raw';
 import { buildFileName, buildRelativePath, noteToMediaItems } from '../src/content/detect/media';
+import { classifyPage, routeKey } from '../src/content/detect/detector';
 import { DEFAULT_SETTINGS } from '../src/shared/types';
 
 /* ------------------------------------------------------------------ */
@@ -744,4 +745,25 @@ test('findNoteInPayload：视频挂在 media 上（不是 video）也认', () =>
   const note = findNoteInPayload({ note: { currentNote: { note: detail } } }, 'v9');
   assert.ok(note);
   assert.equal(note!.videos.length, 1);
+});
+
+/* ------------------------------------------------------------------ */
+/* 路由身份                                                             */
+/* ------------------------------------------------------------------ */
+
+test('routeKey：主页与笔记页都带着 id，query 变化不算换页', () => {
+  assert.equal(routeKey('/explore/abc123'), 'note:abc123');
+  assert.equal(routeKey('/explore/abc123?xsec_token=T&xsec_source=pc_feed'), 'note:abc123');
+  assert.equal(routeKey('/discovery/item/xyz_9'), 'note:xyz_9');
+  assert.equal(routeKey('/user/profile/5f1a'), 'profile:5f1a');
+  assert.equal(routeKey('/user/profile/5f1a?tab=video'), 'profile:5f1a');
+  assert.equal(routeKey('/explore'), 'unknown');
+  assert.equal(classifyPage('/explore/abc123'), 'note');
+  assert.equal(classifyPage('/user/profile/5f1a'), 'profile');
+  assert.equal(classifyPage('/explore'), 'unknown');
+});
+
+test('routeKey：换了账号就是另一次路由（否则面板会把上一个账号的结果留给下一个）', () => {
+  assert.notEqual(routeKey('/user/profile/account-a'), routeKey('/user/profile/account-b'));
+  assert.notEqual(routeKey('/explore/note-a'), routeKey('/explore/note-b'));
 });
